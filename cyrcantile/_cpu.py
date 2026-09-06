@@ -2,6 +2,10 @@
 when no OpenCL device is available.  The math mirrors mercantile exactly."""
 
 import math
+import os
+from concurrent.futures import ThreadPoolExecutor
+
+import numpy as np
 
 from ._types import Tile, LngLat, LngLatBbox, Bbox, XY
 
@@ -176,55 +180,104 @@ def feature(tile: Tile, fid=None, props=None):
 
 
 # ------------------------------------------------------------------ #
-#  Vectorised CPU fallbacks (numpy) — used when OpenCL is unavailable
+#  Parallel CPU execution
 # ------------------------------------------------------------------ #
+# Two engines are supported, chosen at runtime:
+#   * Numba (@njit(parallel=True)) — fastest for these arithmetic-heavy
+#     kernels, with real multicore scaling.
+#   * A chunked ThreadPoolExecutor over NumPy ufuncs — dependency-free
+#     fallback.  NumPy's C loops release the GIL, so threads still scale
+#     across cores for large arrays.
+# If neither applies (small inputs) we just run the plain vectorised
+# single-thread path to avoid dispatch overhead.
 
-def xy_vec(lng, lat, truncate=False):
-    import numpy as _np
+try:
+    from numba import njit, prange
+    HAS_NUMBA = True
+except Exception:  # pragma: no cover
+    HAS_NUMBA = False
+
+_CPU_WORKERS = min(32, (os.cpu_count() or 1))
+# Arrays smaller than this stay on the single-thread path.
+_THREAD_THRESHOLD = 200_000
+
+
+def _chunks(n, workers):
+    size = (n + workers - 1) // workers
+    return [(i * size, min((i + 1) * size, n)) for i in range((n + size - 1) // size)]
+
+
+def _maybe_parallel(arrays, fn, n):
+    """Run ``fn(start, stop)`` for each slice over a shared thread pool.
+
+    ``fn`` receives ``(arrays_subset, start, stop)`` and returns one result
+    per call; the list of per-chunk results is returned.  For inputs whose
+    needs exceed the bounded pool it degrades gracefully.
+    """
+    if n < _THREAD_THRESHOLD or _CPU_WORKERS <= 1:
+        return [fn(arrays, 0, n)]
+    nchunks = min(_CPU_WORKERS, (n + 63) // 64)
+    chunks = [c for c in _chunks(n, nchunks) if c[1] > c[0]]
+    if len(chunks) <= 1:
+        return [fn(arrays, 0, n)]
+    with ThreadPoolExecutor(max_workers=len(chunks)) as ex:
+        return list(ex.map(lambda c: fn(arrays, c[0], c[1]), chunks))
+
+
+@np.errstate(over="ignore", invalid="ignore", divide="ignore")
+def _tile_chunk(lng, lat, zoom, truncate, start, stop):
+    l = lng[start:stop]
+    p = lat[start:stop]
     if truncate:
-        lng = _np.clip(lng, -MAX_LNG, MAX_LNG)
-        lat = _np.clip(lat, -MAX_LAT, MAX_LAT)
-    lat_r = lat * D2R
-    return RE * lng * D2R, RE * _np.log(_np.tan(_np.pi / 4 + lat_r / 2))
-
-
-def lnglat_vec(x, y):
-    import numpy as _np
-    return (x / RE) * R2D, (2 * _np.arctan(_np.exp(y / RE)) - _np.pi / 2) * R2D
-
-
-def tile_vec(lng, lat, zoom, truncate=False):
-    import numpy as _np
-    if truncate:
-        lng = _np.clip(lng, -MAX_LNG, MAX_LNG)
-        lat = _np.clip(lat, -MAX_LAT, MAX_LAT)
-    lat_r = lat * D2R
+        l = np.clip(l, -MAX_LNG, MAX_LNG)
+        p = np.clip(p, -MAX_LAT, MAX_LAT)
+    lat_r = p * D2R
     n = 1 << zoom
-    x = _np.floor((lng + 180.0) / 360.0 * n).astype(_np.int32)
-    y = _np.floor((1.0 - _np.log(_np.tan(_np.pi / 4 + lat_r / 2)) / _np.pi) * 0.5 * n).astype(_np.int32)
+    x = np.floor((l + 180.0) / 360.0 * n).astype(np.int32)
+    y = np.floor((1.0 - np.log(np.tan(np.pi / 4 + lat_r / 2)) / np.pi) * 0.5 * n).astype(np.int32)
     return x, y
 
 
-def ul_vec(tx, zoom):
-    import numpy as _np
+@np.errstate(over="ignore", invalid="ignore", divide="ignore")
+def _xy_chunk(lng, lat, truncate, start, stop):
+    l = lng[start:stop]
+    p = lat[start:stop]
+    if truncate:
+        l = np.clip(l, -MAX_LNG, MAX_LNG)
+        p = np.clip(p, -MAX_LAT, MAX_LAT)
+    lat_r = p * D2R
+    return RE * l * D2R, RE * np.log(np.tan(np.pi / 4 + lat_r / 2))
+
+
+@np.errstate(over="ignore", invalid="ignore", divide="ignore")
+def _lnglat_chunk(x, y, start, stop):
+    x = x[start:stop]
+    y = y[start:stop]
+    return (x / RE) * R2D, (2 * np.arctan(np.exp(y / RE)) - np.pi / 2) * R2D
+
+
+@np.errstate(over="ignore", invalid="ignore", divide="ignore")
+def _ul_chunk(tx, zoom, start, stop):
+    tx = tx[start:stop]
     n = float(1 << zoom)
     lng = tx / n * 360.0 - 180.0
-    lat = _np.arctan(_np.sinh(_np.pi * (1 - 2 * tx / n))) * R2D
+    lat = np.arctan(np.sinh(np.pi * (1 - 2 * tx / n))) * R2D
     return lng, lat
 
 
-def bounds_vec(tx, zoom):
-    import numpy as _np
+@np.errstate(over="ignore", invalid="ignore", divide="ignore")
+def _bounds_chunk(tx, zoom, start, stop):
+    tx = tx[start:stop]
     n = float(1 << zoom)
     w = tx / n * 360.0 - 180.0
     e = (tx + 1) / n * 360.0 - 180.0
-    north = _np.arctan(_np.sinh(_np.pi * (1 - 2 * tx / n))) * R2D
-    south = _np.arctan(_np.sinh(_np.pi * (1 - 2 * (tx + 1) / n))) * R2D
+    north = np.arctan(np.sinh(np.pi * (1 - 2 * tx / n))) * R2D
+    south = np.arctan(np.sinh(np.pi * (1 - 2 * (tx + 1) / n))) * R2D
     return w, south, e, north
 
 
-def xy_bounds_vec(tx, zoom):
-    import numpy as _np
+def _xy_bounds_chunk(tx, zoom, start, stop):
+    tx = tx[start:stop]
     n = float(1 << zoom)
     t_size = CE / n
     left = tx * t_size - CE / 2
@@ -232,3 +285,184 @@ def xy_bounds_vec(tx, zoom):
     top = CE / 2 - tx * t_size
     bottom = top - t_size
     return left, bottom, right, top
+
+
+def _normalise_vec(*arrays):
+    """Coerce a list of flat array-likes to a common-size, contiguous, f64/i64
+    ndarray.  Returns (arrays, n)."""
+    outs = []
+    n = None
+    for a in arrays:
+        a = np.ascontiguousarray(a)
+        outs.append(a)
+        if n is None:
+            n = a.shape[0]
+    return outs, n
+
+
+# Numba JIT kernels (parallel = multicore).  Lazily compiled on first use.
+if HAS_NUMBA:
+    @njit(parallel=True, cache=True, fastmath=True, nogil=True)
+    def _tile_jit(lng, lat, zoom, truncate):
+        n = lng.shape[0]
+        res_x = np.empty(n, dtype=np.int32)
+        res_y = np.empty(n, dtype=np.int32)
+        nn = 1 << zoom
+        pi4 = math.pi / 4
+        for i in prange(n):
+            l = lng[i]
+            p = lat[i]
+            if truncate:
+                l = min(max(l, -MAX_LNG), MAX_LNG)
+                p = min(max(p, -MAX_LAT), MAX_LAT)
+            lat_r = p * D2R
+            res_x[i] = int(math.floor((l + 180.0) / 360.0 * nn))
+            res_y[i] = int(math.floor((1.0 - math.log(math.tan(pi4 + lat_r / 2)) / math.pi) * 0.5 * nn))
+        return res_x, res_y
+
+    @njit(parallel=True, cache=True, fastmath=True, nogil=True)
+    def _xy_jit(lng, lat, truncate):
+        n = lng.shape[0]
+        res_x = np.empty(n)
+        res_y = np.empty(n)
+        pi4 = math.pi / 4
+        for i in prange(n):
+            l = lng[i]
+            p = lat[i]
+            if truncate:
+                l = min(max(l, -MAX_LNG), MAX_LNG)
+                p = min(max(p, -MAX_LAT), MAX_LAT)
+            lat_r = p * D2R
+            res_x[i] = RE * l * D2R
+            res_y[i] = RE * math.log(math.tan(pi4 + lat_r / 2))
+        return res_x, res_y
+
+    @njit(parallel=True, cache=True, fastmath=True, nogil=True)
+    def _lnglat_jit(x, y):
+        n = x.shape[0]
+        res_x = np.empty(n)
+        res_y = np.empty(n)
+        for i in prange(n):
+            res_x[i] = (x[i] / RE) * R2D
+            res_y[i] = (2 * math.atan(math.exp(y[i] / RE)) - math.pi / 2) * R2D
+        return res_x, res_y
+
+    @njit(parallel=True, cache=True, fastmath=True, nogil=True)
+    def _ul_jit(tx, zoom):
+        n = tx.shape[0]
+        res_x = np.empty(n)
+        res_y = np.empty(n)
+        nn = float(1 << zoom)
+        for i in prange(n):
+            res_x[i] = tx[i] / nn * 360.0 - 180.0
+            res_y[i] = math.atan(math.sinh(math.pi * (1 - 2 * tx[i] / nn))) * R2D
+        return res_x, res_y
+
+    @njit(parallel=True, cache=True, fastmath=True, nogil=True)
+    def _bounds_jit(tx, zoom):
+        n = tx.shape[0]
+        w = np.empty(n)
+        s = np.empty(n)
+        e = np.empty(n)
+        no = np.empty(n)
+        nn = float(1 << zoom)
+        for i in prange(n):
+            t = tx[i]
+            w[i] = t / nn * 360.0 - 180.0
+            e[i] = (t + 1) / nn * 360.0 - 180.0
+            no[i] = math.atan(math.sinh(math.pi * (1 - 2 * t / nn))) * R2D
+            s[i] = math.atan(math.sinh(math.pi * (1 - 2 * (t + 1) / nn))) * R2D
+        return w, s, e, no
+
+    @njit(parallel=True, cache=True, fastmath=True, nogil=True)
+    def _xy_bounds_jit(tx, zoom):
+        n = tx.shape[0]
+        left = np.empty(n)
+        top = np.empty(n)
+        nn = float(1 << zoom)
+        t_size = CE / nn
+        hce = CE * 0.5
+        for i in prange(n):
+            t = tx[i]
+            left[i] = t * t_size - hce
+            top[i] = hce - t * t_size
+        return left, top - t_size, left + t_size, top
+
+
+# ------------------------------------------------------------------ #
+#  Vectorised CPU fallbacks (numpy) — used when OpenCL is unavailable
+# ------------------------------------------------------------------ #
+
+def _choose_engine(n):
+    """Return ('numba', f) | ('thread', f) | ('single', f) for an array of n."""
+    if HAS_NUMBA and n >= _THREAD_THRESHOLD:
+        return "numba"
+    if _CPU_WORKERS > 1 and n >= _THREAD_THRESHOLD:
+        return "thread"
+    return "single"
+
+
+def xy_vec(lng, lat, truncate=False):
+    (lng, lat), n = _normalise_vec(lng, lat)
+    engine = _choose_engine(n)
+    if engine == "numba":
+        return _xy_jit(lng, lat, truncate)
+    if engine == "thread":
+        parts = _maybe_parallel((lng, lat), lambda a, s, e: _xy_chunk(a[0], a[1], truncate, s, e), n)
+        return np.concatenate([p[0] for p in parts]), np.concatenate([p[1] for p in parts])
+    return _xy_chunk(lng, lat, truncate, 0, n)
+
+
+def lnglat_vec(x, y):
+    (x, y), n = _normalise_vec(x, y)
+    engine = _choose_engine(n)
+    if engine == "numba":
+        return _lnglat_jit(x, y)
+    if engine == "thread":
+        parts = _maybe_parallel((x, y), lambda a, s, e: _lnglat_chunk(a[0], a[1], s, e), n)
+        return np.concatenate([p[0] for p in parts]), np.concatenate([p[1] for p in parts])
+    return _lnglat_chunk(x, y, 0, n)
+
+
+def tile_vec(lng, lat, zoom, truncate=False):
+    (lng, lat), n = _normalise_vec(lng, lat)
+    engine = _choose_engine(n)
+    if engine == "numba":
+        return _tile_jit(lng, lat, zoom, truncate)
+    if engine == "thread":
+        parts = _maybe_parallel((lng, lat), lambda a, s, e: _tile_chunk(a[0], a[1], zoom, truncate, s, e), n)
+        return np.concatenate([p[0] for p in parts]), np.concatenate([p[1] for p in parts])
+    return _tile_chunk(lng, lat, zoom, truncate, 0, n)
+
+
+def ul_vec(tx, zoom):
+    (tx,), n = _normalise_vec(tx)
+    engine = _choose_engine(n)
+    if engine == "numba":
+        return _ul_jit(tx, zoom)
+    if engine == "thread":
+        parts = _maybe_parallel((tx,), lambda a, s, e: _ul_chunk(a[0], zoom, s, e), n)
+        return np.concatenate([p[0] for p in parts]), np.concatenate([p[1] for p in parts])
+    return _ul_chunk(tx, zoom, 0, n)
+
+
+def bounds_vec(tx, zoom):
+    (tx,), n = _normalise_vec(tx)
+    engine = _choose_engine(n)
+    if engine == "numba":
+        return _bounds_jit(tx, zoom)
+    if engine == "thread":
+        parts = _maybe_parallel((tx,), lambda a, s, e: _bounds_chunk(a[0], zoom, s, e), n)
+        return tuple(np.concatenate([p[i] for p in parts]) for i in range(4))
+    return _bounds_chunk(tx, zoom, 0, n)
+
+
+def xy_bounds_vec(tx, zoom):
+    (tx,), n = _normalise_vec(tx)
+    engine = _choose_engine(n)
+    if engine == "numba":
+        return _xy_bounds_jit(tx, zoom)
+    if engine == "thread":
+        parts = _maybe_parallel((tx,), lambda a, s, e: _xy_bounds_chunk(a[0], zoom, s, e), n)
+        return tuple(np.concatenate([p[i] for p in parts]) for i in range(4))
+    return _xy_bounds_chunk(tx, zoom, 0, n)

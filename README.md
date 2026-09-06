@@ -45,7 +45,20 @@ cyrcantile/
 
 - **Single value** → pure-Python CPU path (minimal overhead, no GPU round-trip)
 - **Array input** → GPU kernel (OpenCL via PyOpenCL, or Vulkan via wgpu)
-- **No GPU device** → automatic NumPy vectorised fallback
+- **No GPU device** → fast multicore CPU fallback
+
+### CPU parallelism
+
+The NumPy vectorised fallback runs on **all cores** for large batches. Two
+engines are chosen at runtime:
+
+| Engine | When | Notes |
+|--------|------|-------|
+| **Numba** (`@njit(parallel=True)`) | `numba` installed | Fastest; true multicore scaling (`fastmath`) |
+| **Thread pool** (chunked NumPy) | no `numba`; ≥ 200k elements | Dependency-free; scales across cores |
+| **Single-thread NumPy** | < 200k elements | Avoids dispatch overhead on small inputs |
+
+`ct.HAS_NUMBA` reports whether the JIT path is active.
 
 ## Installation
 
@@ -93,12 +106,13 @@ feat = ct.feature(t, fid=1, props={"layer": "base"})
 python main.py
 ```
 
-Typical output (100K random points, zoom 12):
+Typical output (8M random points, zoom 12, 4 cores):
 
 | Backend | Time |
 |---------|------|
-| OpenCL (GPU) | ~2 ms |
-| NumPy (CPU) | ~45 ms |
+| Vulkan (llvmpipe) | ~550 ms |
+| CPU single-thread | ~527 ms |
+| CPU parallel (numba) | ~57 ms |
 
 ## Migration from Cython
 

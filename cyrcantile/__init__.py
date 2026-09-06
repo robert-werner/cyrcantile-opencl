@@ -30,6 +30,7 @@ import numpy as np
 from ._types import Tile, LngLat, LngLatBbox, Bbox, XY, MinMax
 from . import _cpu as cpu
 from ._backend import get_backend, HAS_OPENCL
+from ._cpu import HAS_NUMBA
 
 __version__ = "0.2.0"
 __all__ = [
@@ -38,7 +39,7 @@ __all__ = [
     "quadkey", "quadkey_to_tile", "parent", "children",
     "neighbors", "bounding_tile", "tiles", "feature",
     "radians", "degrees", "minmax", "truncate_lnglat",
-    "HAS_OPENCL",
+    "HAS_OPENCL", "HAS_NUMBA",
 ]
 
 # Re-export constants

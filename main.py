@@ -118,6 +118,34 @@ def demo_batch_vulkan():
         print(f"  Vulkan == CPU results: {match}")
 
 
+def demo_cpu_parallel():
+    banner("CPU PARALLEL BENCHMARK")
+    from cyrcantile import _cpu
+    print(f"  Numba available: {ct.HAS_NUMBA}   CPU workers: {_cpu._CPU_WORKERS}")
+
+    np.random.seed(42)
+    n = 8_000_000
+    lons = np.random.uniform(-180, 180, n)
+    lats = np.random.uniform(-85, 85, n)
+    zoom = 12
+
+    # warmup (compiles numba kernels / first pass)
+    _cpu.tile_vec(lons[:4096], lats[:4096], zoom)
+
+    engine = _cpu._choose_engine(n)
+    t0 = time.perf_counter()
+    xs_c, ys_c = _cpu.tile_vec(lons, lats, zoom)
+    cpu_ms = (time.perf_counter() - t0) * 1000
+    print(f"  CPU tile_vec({n:,} pts, z={zoom})  = {cpu_ms:.1f} ms  (engine: {engine})")
+
+    # single-thread reference for the speedup ratio
+    t0 = time.perf_counter()
+    _cpu._tile_chunk(lons, lats, zoom, False, 0, n)
+    single_ms = (time.perf_counter() - t0) * 1000
+    print(f"  CPU single-thread              = {single_ms:.1f} ms")
+    print(f"  parallel speedup               = {single_ms / cpu_ms:.2f}x")
+
+
 def demo_tiles_in_bbox():
     banner("TILES IN BBOX")
     west, south, east, north = -9.5, 53.0, -9.0, 53.3
@@ -140,6 +168,7 @@ if __name__ == "__main__":
     demo_single()
     demo_batch()
     demo_batch_vulkan()
+    demo_cpu_parallel()
     demo_tiles_in_bbox()
     demo_feature()
     print("\nDone.")

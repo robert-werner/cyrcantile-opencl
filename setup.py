@@ -15,6 +15,8 @@ setup(
     ],
     extras_require={
         "opencl": ["pyopencl>=2021.1"],
+        "vulkan": ["wgpu>=0.17"],
+        "cpu-speed": ["numba>=0.60"],
     },
     classifiers=[
         "Programming Language :: Python :: 3",
