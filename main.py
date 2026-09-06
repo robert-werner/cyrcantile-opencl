@@ -73,6 +73,48 @@ def demo_batch():
         print(f"  GPU == CPU results: {match}")
 
 
+def demo_batch_vulkan():
+    banner("BATCH API — Vulkan backend")
+    try:
+        from cyrcantile._vulkan import get_backend as vk_get_backend, HAS_VULKAN
+    except Exception:
+        HAS_VULKAN = False
+        vk_get_backend = None
+    print(f"  Vulkan available: {HAS_VULKAN}")
+
+    np.random.seed(42)
+    n = 100_000
+    lons = np.random.uniform(-180, 180, n)
+    lats = np.random.uniform(-85, 85, n)
+    zoom = 12
+
+    if HAS_VULKAN and vk_get_backend is not None:
+        try:
+            vk = vk_get_backend()
+            # warmup
+            vk.tile(lons[:1024], lats[:1024], zoom)
+            t0 = time.perf_counter()
+            xs, ys = vk.tile(lons, lats, zoom)
+            gpu_ms = (time.perf_counter() - t0) * 1000
+            print(f"  Vulkan tile({n:,} pts, z={zoom}) = {gpu_ms:.1f} ms")
+        except Exception as e:
+            print(f"  (Vulkan benchmark failed: {e})")
+            gpu_ms = xs = ys = None
+    else:
+        print("  (Vulkan not available — skipping Vulkan benchmark)")
+        gpu_ms = xs = ys = None
+
+    from cyrcantile import _cpu
+    t0 = time.perf_counter()
+    xs_c, ys_c = _cpu.tile_vec(lons, lats, zoom)
+    cpu_ms = (time.perf_counter() - t0) * 1000
+    print(f"  CPU tile_vec({n:,} pts, z={zoom})  = {cpu_ms:.1f} ms")
+
+    if xs is not None:
+        match = np.array_equal(xs, xs_c) and np.array_equal(ys, ys_c)
+        print(f"  Vulkan == CPU results: {match}")
+
+
 def demo_tiles_in_bbox():
     banner("TILES IN BBOX")
     west, south, east, north = -9.5, 53.0, -9.0, 53.3
@@ -94,6 +136,7 @@ def demo_feature():
 if __name__ == "__main__":
     demo_single()
     demo_batch()
+    demo_batch_vulkan()
     demo_tiles_in_bbox()
     demo_feature()
     print("\nDone.")
