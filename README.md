@@ -1,7 +1,7 @@
-# cyrcantile — OpenCL / Vulkan
+# cyrcantile — OpenCL / Vulkan / CUDA
 
-GPU-accelerated spherical-mercator tile utilities — an OpenCL and Vulkan
-kernel rewrite of the original [cyrcantile](https://github.com/robert-werner/cyrcantile)
+GPU-accelerated spherical-mercator tile utilities — an OpenCL, Vulkan and
+CUDA kernel rewrite of the original [cyrcantile](https://github.com/robert-werner/cyrcantile)
 Cython project.
 
 ## What it does
@@ -9,7 +9,7 @@ Cython project.
 Provides the same API as [mercantile](https://github.com/mapbox/mercantile)
 for converting between geographic coordinates (WGS-84), Web Mercator
 (EPSG:3857), and XYZ tile indices — but with the compute-heavy batch
-operations offloaded to GPU kernels (OpenCL or Vulkan).
+operations offloaded to GPU kernels (OpenCL, Vulkan, or CUDA).
 
 ## Architecture
 
@@ -19,6 +19,7 @@ cyrcantile/
 ├── _kernels.cl       # OpenCL C kernels (13 batch operations)
 ├── _backend.py       # PyOpenCL context manager & kernel dispatch
 ├── _vulkan.py        # wgpu/Vulkan backend with WGSL compute kernels
+├── _cuda.py          # numba.cuda backend with device kernels
 ├── _cpu.py           # Pure-Python + NumPy fallback
 └── _types.py         # NamedTuple types (Tile, LngLat, Bbox, …)
 ```
@@ -44,8 +45,13 @@ cyrcantile/
 ### Dispatch logic
 
 - **Single value** → pure-Python CPU path (minimal overhead, no GPU round-trip)
-- **Array input** → GPU kernel (OpenCL via PyOpenCL, or Vulkan via wgpu)
+- **Array input** → GPU kernel (OpenCL via PyOpenCL, Vulkan via wgpu, or CUDA via numba)
 - **No GPU device** → fast multicore CPU fallback
+
+The OpenCL path is dispatched automatically by the public API. The Vulkan
+and CUDA backends are used directly via their `get_backend()` /
+`HAS_VULKAN` / `HAS_CUDA` exports (see `main.py`), so they never interfere
+with automatic dispatch or each other.
 
 ### CPU parallelism
 
@@ -67,9 +73,14 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
-> Requires a Vulkan-capable device (e.g. a GPU or Mesa `llvmpipe` software
-> renderer). Install `wgpu` with `pip install wgpu`. The OpenCL path needs
-> `pyopencl` (Linux may need `ocl-icd-opencl-dev`).
+> Requires a GPU backend. Install `wgpu` for Vulkan, `pyopencl` for OpenCL
+> (Linux may need `ocl-icd-opencl-dev`), or run `pip install numba` and have
+> a CUDA-capable GPU + driver for the CUDA backend.
+
+> **CUDA support:** the CUDA backend (`_cuda.py`) JIT-compiles the same
+> kernels with `numba.cuda`. `HAS_CUDA` is `True` only when numba is
+> installed *and* an NVIDIA GPU is reachable. Results match the OpenCL
+> kernels exactly.
 
 > **Note:** on `llvmpipe` (software) Vulkan devices the f64 transcendentals
 > (`exp`/`log`/`tan`/`atan`/`sin`/`cos`/`sinh`/`exp2`) compute incorrectly, so
@@ -111,6 +122,7 @@ Typical output (8M random points, zoom 12, 4 cores):
 | Backend | Time |
 |---------|------|
 | Vulkan (llvmpipe) | ~550 ms |
+| CUDA (numba) | device-dependent |
 | CPU single-thread | ~527 ms |
 | CPU parallel (numba) | ~57 ms |
 
@@ -119,9 +131,9 @@ Typical output (8M random points, zoom 12, 4 cores):
 | Original (Cython) | OpenCL rewrite |
 |---|---|
 | `_base.pxd` (struct decls) | `_types.py` (NamedTuples) |
-| `_base.pyx` (Cython impl) | `_kernels.cl` + `_backend.py` / `_vulkan.py` |
+| `_base.pyx` (Cython impl) | `_kernels.cl` + `_backend.py` / `_vulkan.py` / `_cuda.py` |
 | `setup.py` (cythonize) | `setup.py` (package_data) |
-| `numba` dependency | `wgpu` / `pyopencl` dependency |
+| `numba` dependency | `wgpu` / `pyopencl` / `numba` (CUDA) dependency |
 
 ## License
 

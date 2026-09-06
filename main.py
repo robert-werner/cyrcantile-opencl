@@ -118,6 +118,48 @@ def demo_batch_vulkan():
         print(f"  Vulkan == CPU results: {match}")
 
 
+def demo_batch_cuda():
+    banner("BATCH API — CUDA backend")
+    try:
+        from cyrcantile._cuda import get_backend as cuda_get_backend, HAS_CUDA
+    except Exception:
+        HAS_CUDA = False
+        cuda_get_backend = None
+    print(f"  CUDA available: {HAS_CUDA}")
+
+    np.random.seed(42)
+    n = 8_000_000
+    lons = np.random.uniform(-180, 180, n)
+    lats = np.random.uniform(-85, 85, n)
+    zoom = 12
+
+    if HAS_CUDA and cuda_get_backend is not None:
+        try:
+            cu = cuda_get_backend()
+            # warmup (compiles the JIT kernels)
+            cu.tile(lons[:4096], lats[:4096], zoom)
+            t0 = time.perf_counter()
+            xs, ys = cu.tile(lons, lats, zoom)
+            gpu_ms = (time.perf_counter() - t0) * 1000
+            print(f"  CUDA tile({n:,} pts, z={zoom}) = {gpu_ms:.1f} ms")
+        except Exception as e:
+            print(f"  (CUDA benchmark failed: {e})")
+            gpu_ms = xs = ys = None
+    else:
+        print("  (CUDA not available — skipping CUDA benchmark)")
+        gpu_ms = xs = ys = None
+
+    from cyrcantile import _cpu
+    t0 = time.perf_counter()
+    xs_c, ys_c = _cpu.tile_vec(lons, lats, zoom)
+    cpu_ms = (time.perf_counter() - t0) * 1000
+    print(f"  CPU tile_vec({n:,} pts, z={zoom})  = {cpu_ms:.1f} ms")
+
+    if xs is not None:
+        match = np.array_equal(xs, xs_c) and np.array_equal(ys, ys_c)
+        print(f"  CUDA == CPU results: {match}")
+
+
 def demo_cpu_parallel():
     banner("CPU PARALLEL BENCHMARK")
     from cyrcantile import _cpu
@@ -168,6 +210,7 @@ if __name__ == "__main__":
     demo_single()
     demo_batch()
     demo_batch_vulkan()
+    demo_batch_cuda()
     demo_cpu_parallel()
     demo_tiles_in_bbox()
     demo_feature()
