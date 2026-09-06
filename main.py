@@ -83,7 +83,10 @@ def demo_batch_vulkan():
     print(f"  Vulkan available: {HAS_VULKAN}")
 
     np.random.seed(42)
-    n = 100_000
+    # 8M points: large enough to be a meaningful batch benchmark while each
+    # f64 input buffer (64 MB) stays under the typical per-binding limit of
+    # 128 MB (max_storage_buffer_binding_size) seen on llvmpipe.
+    n = 8_000_000
     lons = np.random.uniform(-180, 180, n)
     lats = np.random.uniform(-85, 85, n)
     zoom = 12
@@ -91,8 +94,8 @@ def demo_batch_vulkan():
     if HAS_VULKAN and vk_get_backend is not None:
         try:
             vk = vk_get_backend()
-            # warmup
-            vk.tile(lons[:1024], lats[:1024], zoom)
+            # warmup (also compiles the pipeline)
+            vk.tile(lons[:4096], lats[:4096], zoom)
             t0 = time.perf_counter()
             xs, ys = vk.tile(lons, lats, zoom)
             gpu_ms = (time.perf_counter() - t0) * 1000

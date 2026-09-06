@@ -44,6 +44,19 @@ _UNIFORM_PREAMBLE = (
     "@group(0) @binding(%d) var<uniform> u: array<vec4<i32>, 2>;\n" % _UNIFORM_BINDING
 )
 
+# The compute grid is 2D: each row covers this many threads (a non-zero
+# multiple of the 256-invocation workgroup size).  Keeping `x` well under
+# the 65535-workgroup-per-dimension limit means even 100M+ element batches
+# can be dispatched as several rows of fixed width instead of one huge row.
+_ROW_THREADS = 1 << 20  # 1,048,576 threads == 4096 workgroups of 256
+_ROW_WORKGROUPS = _ROW_THREADS // 256
+
+# Baked into every kernel so the flat index is `gid.y * _ROW_THREADS + gid.x`.
+_FLAT_IDX_SRC = (
+    f"const FLAT_STRIDE: u32 = {_ROW_THREADS}u;\n"
+    "fn flat_id(gid: vec3<u32>) -> i32 { return i32(gid.x + gid.y * FLAT_STRIDE); }\n"
+)
+
 _PI = 3.14159265358979323846
 _HALF_PI = 1.57079632679489661923
 _QUARTER_PI = 0.78539816339744830962
@@ -72,6 +85,7 @@ def _tile_y(p: str) -> str:
 _WGSL = {
     "xy": (
         _UNIFORM_PREAMBLE
+        + _FLAT_IDX_SRC
         + _clamp_src()
         + """
 @group(0) @binding(0) var<storage, read> lng: array<f64>;
@@ -80,7 +94,7 @@ _WGSL = {
 @group(0) @binding(3) var<storage, read_write> oy: array<f64>;
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = i32(gid.x);
+    let i = flat_id(gid);
     if (i >= u[0].y) { return; }
     var l = lng[i];
     var p = lat[i];
@@ -93,6 +107,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     ),
     "lnglat": (
         _UNIFORM_PREAMBLE
+        + _FLAT_IDX_SRC
         + """
 @group(0) @binding(0) var<storage, read> x: array<f64>;
 @group(0) @binding(1) var<storage, read> y: array<f64>;
@@ -100,7 +115,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 @group(0) @binding(3) var<storage, read_write> olat: array<f64>;
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = i32(gid.x);
+    let i = flat_id(gid);
     if (i >= u[0].x) { return; }
     olng[i] = (x[i] / __RE__) * __R2D__;
     olat[i] = (2.0 * atan(exp(y[i] / __RE__)) - __HALF_PI__) * __R2D__;
@@ -109,6 +124,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     ),
     "tile": (
         _UNIFORM_PREAMBLE
+        + _FLAT_IDX_SRC
         + _clamp_src()
         + """
 @group(0) @binding(0) var<storage, read> lng: array<f64>;
@@ -117,7 +133,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 @group(0) @binding(3) var<storage, read_write> oy: array<i32>;
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = i32(gid.x);
+    let i = flat_id(gid);
     if (i >= u[0].z) { return; }
     var l = lng[i];
     var p = lat[i];
@@ -131,6 +147,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     ),
     "ul": (
         _UNIFORM_PREAMBLE
+        + _FLAT_IDX_SRC
         + """
 @group(0) @binding(0) var<storage, read> tx: array<i32>;
 @group(0) @binding(1) var<storage, read> ty: array<i32>;
@@ -138,7 +155,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 @group(0) @binding(3) var<storage, read_write> olat: array<f64>;
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = i32(gid.x);
+    let i = flat_id(gid);
     if (i >= u[0].y) { return; }
     let z2 = exp2(f64(u[0].x));
     olng[i] = f64(tx[i]) / z2 * 360.0 - 180.0;
@@ -148,6 +165,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     ),
     "bounds": (
         _UNIFORM_PREAMBLE
+        + _FLAT_IDX_SRC
         + """
 @group(0) @binding(0) var<storage, read> tx: array<i32>;
 @group(0) @binding(1) var<storage, read> ty: array<i32>;
@@ -157,7 +175,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 @group(0) @binding(5) var<storage, read_write> on: array<f64>;
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = i32(gid.x);
+    let i = flat_id(gid);
     if (i >= u[0].y) { return; }
     let z2 = exp2(f64(u[0].x));
     ow[i] = f64(tx[i]) / z2 * 360.0 - 180.0;
@@ -169,6 +187,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     ),
     "xy_bounds": (
         _UNIFORM_PREAMBLE
+        + _FLAT_IDX_SRC
         + """
 @group(0) @binding(0) var<storage, read> tx: array<i32>;
 @group(0) @binding(1) var<storage, read> ty: array<i32>;
@@ -178,7 +197,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 @group(0) @binding(5) var<storage, read_write> ot: array<f64>;
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = i32(gid.x);
+    let i = flat_id(gid);
     if (i >= u[0].y) { return; }
     let z2 = exp2(f64(u[0].x));
     let ts = __CE__ / z2;
@@ -191,13 +210,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     ),
     "quadkey_encode": (
         _UNIFORM_PREAMBLE
+        + _FLAT_IDX_SRC
         + """
 @group(0) @binding(0) var<storage, read> tx: array<i32>;
 @group(0) @binding(1) var<storage, read> ty: array<i32>;
 @group(0) @binding(2) var<storage, read_write> qk: array<u64>;
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = i32(gid.x);
+    let i = flat_id(gid);
     if (i >= u[0].y) { return; }
     let zoom = u[0].x;
     var x: u64 = u64(tx[i]);
@@ -217,13 +237,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     ),
     "quadkey_decode": (
         _UNIFORM_PREAMBLE
+        + _FLAT_IDX_SRC
         + """
 @group(0) @binding(0) var<storage, read> qk: array<u64>;
 @group(0) @binding(1) var<storage, read_write> ox: array<i32>;
 @group(0) @binding(2) var<storage, read_write> oy: array<i32>;
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = i32(gid.x);
+    let i = flat_id(gid);
     if (i >= u[0].y) { return; }
     let zoom = u[0].x;
     let q = qk[i];
@@ -245,6 +266,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     ),
     "parent": (
         _UNIFORM_PREAMBLE
+        + _FLAT_IDX_SRC
         + """
 @group(0) @binding(0) var<storage, read> tx: array<i32>;
 @group(0) @binding(1) var<storage, read> ty: array<i32>;
@@ -252,7 +274,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 @group(0) @binding(3) var<storage, read_write> oy: array<i32>;
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = i32(gid.x);
+    let i = flat_id(gid);
     if (i >= u[0].y) { return; }
     if (u[0].x == 0) {
         ox[i] = tx[i]; oy[i] = ty[i];
@@ -264,6 +286,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     ),
     "children": (
         _UNIFORM_PREAMBLE
+        + _FLAT_IDX_SRC
         + """
 @group(0) @binding(0) var<storage, read> tx: array<i32>;
 @group(0) @binding(1) var<storage, read> ty: array<i32>;
@@ -271,7 +294,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 @group(0) @binding(3) var<storage, read_write> oy: array<i32>;
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = i32(gid.x);
+    let i = flat_id(gid);
     if (i >= u[0].x) { return; }
     let x2 = tx[i] << 1;
     let y2 = ty[i] << 1;
@@ -285,6 +308,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     ),
     "neighbors": (
         _UNIFORM_PREAMBLE
+        + _FLAT_IDX_SRC
         + """
 @group(0) @binding(0) var<storage, read> tx: array<i32>;
 @group(0) @binding(1) var<storage, read> ty: array<i32>;
@@ -292,7 +316,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 @group(0) @binding(3) var<storage, read_write> oy: array<i32>;
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = i32(gid.x);
+    let i = flat_id(gid);
     if (i >= u[0].x) { return; }
     let x = tx[i];
     let y = ty[i];
@@ -310,6 +334,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     ),
     "bounding_tile": (
         _UNIFORM_PREAMBLE
+        + _FLAT_IDX_SRC
         + _clamp_src()
         + """
 @group(0) @binding(0) var<storage, read> west: array<f64>;
@@ -320,7 +345,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 @group(0) @binding(5) var<storage, read_write> oy: array<i32>;
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = i32(gid.x);
+    let i = flat_id(gid);
     if (i >= u[0].y) { return; }
     let z2 = exp2(f64(u[0].x));
     let latn = clamp_lat(north[i]) * __D2R__;
@@ -331,12 +356,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     ),
     "tiles_in_bbox": (
         _UNIFORM_PREAMBLE
+        + _FLAT_IDX_SRC
         + """
 @group(0) @binding(0) var<storage, read_write> ox: array<i32>;
 @group(0) @binding(1) var<storage, read_write> oy: array<i32>;
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = i32(gid.x);
+    let i = flat_id(gid);
     if (i >= u[0].w) { return; }
     ox[i] = u[0].x + i % u[0].z;
     oy[i] = u[0].y + i / u[0].z;
@@ -397,11 +423,16 @@ class VulkanBackend:
         bind_group = self.device.create_bind_group(
             layout=pipe.get_bind_group_layout(0), entries=bindings
         )
+        # Cover `n` threads with a 2D grid of fixed-width rows.  Each row is
+        # _ROW_WORKGROUPS (4096) workgroups of 256 threads (= _ROW_THREADS
+        # invocations); extra rows add 1 to the y dimension, which stays well
+        # within the per-dimension 65535 workgroup limit for realistic sizes.
+        rows = (n + _ROW_THREADS - 1) // _ROW_THREADS
         encoder = self.device.create_command_encoder()
         pass_enc = encoder.begin_compute_pass()
         pass_enc.set_pipeline(pipe)
         pass_enc.set_bind_group(0, bind_group)
-        pass_enc.dispatch_workgroups((n + 255) // 256)
+        pass_enc.dispatch_workgroups(_ROW_WORKGROUPS, rows, 1)
         pass_enc.end()
         self.device.queue.submit([encoder.finish()])
 
