@@ -1,7 +1,7 @@
-# cyrcantile — OpenCL
+# cyrcantile — OpenCL / Vulkan
 
-GPU-accelerated spherical-mercator tile utilities — an OpenCL kernel
-rewrite of the original [cyrcantile](https://github.com/robert-werner/cyrcantile)
+GPU-accelerated spherical-mercator tile utilities — an OpenCL and Vulkan
+kernel rewrite of the original [cyrcantile](https://github.com/robert-werner/cyrcantile)
 Cython project.
 
 ## What it does
@@ -9,7 +9,7 @@ Cython project.
 Provides the same API as [mercantile](https://github.com/mapbox/mercantile)
 for converting between geographic coordinates (WGS-84), Web Mercator
 (EPSG:3857), and XYZ tile indices — but with the compute-heavy batch
-operations offloaded to OpenCL kernels running on the GPU.
+operations offloaded to GPU kernels (OpenCL or Vulkan).
 
 ## Architecture
 
@@ -18,6 +18,7 @@ cyrcantile/
 ├── __init__.py       # Public API — auto-dispatches CPU / GPU
 ├── _kernels.cl       # OpenCL C kernels (13 batch operations)
 ├── _backend.py       # PyOpenCL context manager & kernel dispatch
+├── _vulkan.py        # wgpu/Vulkan backend with WGSL compute kernels
 ├── _cpu.py           # Pure-Python + NumPy fallback
 └── _types.py         # NamedTuple types (Tile, LngLat, Bbox, …)
 ```
@@ -43,8 +44,8 @@ cyrcantile/
 ### Dispatch logic
 
 - **Single value** → pure-Python CPU path (minimal overhead, no GPU round-trip)
-- **Array input** → OpenCL kernel (parallel GPU computation)
-- **No OpenCL device** → automatic NumPy vectorised fallback
+- **Array input** → GPU kernel (OpenCL via PyOpenCL, or Vulkan via wgpu)
+- **No GPU device** → automatic NumPy vectorised fallback
 
 ## Installation
 
@@ -53,8 +54,14 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
-> Requires an OpenCL-capable GPU and platform drivers. Install `pyopencl`
-> with `pip install pyopencl` (Linux may need `ocl-icd-opencl-dev`).
+> Requires a Vulkan-capable device (e.g. a GPU or Mesa `llvmpipe` software
+> renderer). Install `wgpu` with `pip install wgpu`. The OpenCL path needs
+> `pyopencl` (Linux may need `ocl-icd-opencl-dev`).
+
+> **Note:** on `llvmpipe` (software) Vulkan devices the f64 transcendentals
+> (`exp`/`log`/`tan`/`atan`/`sin`/`cos`/`sinh`/`exp2`) compute incorrectly, so
+> validate with `sqrt`/`floor`-based kernels (parent/children/neighbors) there
+> or use a real GPU.
 
 ## Usage
 
@@ -98,9 +105,9 @@ Typical output (100K random points, zoom 12):
 | Original (Cython) | OpenCL rewrite |
 |---|---|
 | `_base.pxd` (struct decls) | `_types.py` (NamedTuples) |
-| `_base.pyx` (Cython impl) | `_kernels.cl` + `_backend.py` |
+| `_base.pyx` (Cython impl) | `_kernels.cl` + `_backend.py` / `_vulkan.py` |
 | `setup.py` (cythonize) | `setup.py` (package_data) |
-| `numba` dependency | `pyopencl` dependency |
+| `numba` dependency | `wgpu` / `pyopencl` dependency |
 
 ## License
 

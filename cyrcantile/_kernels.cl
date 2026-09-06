@@ -4,6 +4,7 @@
 
 #define PI       3.14159265358979323846
 #define HALF_PI  1.57079632679489661923
+#define QUARTER_PI 0.78539816339744830962
 #define R2D      57.29577951308232
 #define D2R      0.017453292519943295
 #define RE       6378137.0
@@ -12,13 +13,18 @@
 #define MAX_LNG  180.0
 
 /* ---- helpers -------------------------------------------------- */
+/* Branch-based clamps are faster than fmin/fmax on most GPUs and,
+   more importantly, match the CPU fallback exactly (clamping only
+   happens when `truncate` is requested). */
 
 double _clamp_lat(double lat) {
-    return fmax(-MAX_LAT, fmin(MAX_LAT, lat));
+    if (lat >  MAX_LAT) return  MAX_LAT;
+    if (lat < -MAX_LAT) return -MAX_LAT;
+    return lat;
 }
 
 double _clamp_lng(double lng) {
-    if (lng > MAX_LNG)  return MAX_LNG;
+    if (lng >  MAX_LNG) return  MAX_LNG;
     if (lng < -MAX_LNG) return -MAX_LNG;
     return lng;
 }
@@ -36,11 +42,16 @@ __kernel void xy_batch(
     size_t i = get_global_id(0);
     if (i >= n) return;
 
-    double l = truncate ? _clamp_lng(lng[i]) : lng[i];
-    double p = _clamp_lat(lat[i]) * D2R;
+    double l = lng[i];
+    double p = lat[i];
+    if (truncate) {
+        l = _clamp_lng(l);
+        p = _clamp_lat(p);
+    }
+    p *= D2R;
 
     ox[i] = RE * l * D2R;
-    oy[i] = RE * log(tan(HALF_PI + p * 0.5));
+    oy[i] = RE * log(tan(QUARTER_PI + p * 0.5));
 }
 
 /* ---- 2. Web Mercator (EPSG:3857) -> Geographic (WGS-84) ----- */
@@ -73,12 +84,17 @@ __kernel void tile_batch(
     size_t i = get_global_id(0);
     if (i >= n) return;
 
-    double l = truncate ? _clamp_lng(lng[i]) : lng[i];
-    double p = _clamp_lat(lat[i]) * D2R;
+    double l = lng[i];
+    double p = lat[i];
+    if (truncate) {
+        l = _clamp_lng(l);
+        p = _clamp_lat(p);
+    }
+    p *= D2R;
     double z2 = exp2((double)zoom);
 
     ox[i] = (int)floor((l + 180.0) / 360.0 * z2);
-    oy[i] = (int)floor((1.0 - log(tan(HALF_PI + p * 0.5)) / PI) * 0.5 * z2);
+    oy[i] = (int)floor((1.0 - log(tan(QUARTER_PI + p * 0.5)) / PI) * 0.5 * z2);
 }
 
 /* ---- 4. Tile -> Upper-Left corner (lng, lat) --------------- */
@@ -159,13 +175,19 @@ __kernel void quadkey_encode_batch(
     size_t i = get_global_id(0);
     if (i >= n) return;
 
-    ulong qk = 0;
-    for (int j = zoom; j > 0; j--) {
-        int mask  = 1 << (j - 1);
-        int digit = 0;
-        if (tx[i] & mask) digit += 1;
-        if (ty[i] & mask) digit += 2;
-        qk = (qk << 2) | (ulong)digit;
+    /* Interleave the bits of tx and ty into a quadkey. The mask for
+       the highest digit with a 2-bit slot is 3 << (2*(zoom-1)); we walk
+       it down, extracting each 2-bit digit with a shift+and instead of
+       a per-digit shift of a freshly built mask (cheaper on GPU ALUs). */
+    ulong m   = 3UL << (2 * (zoom - 1));
+    ulong x   = (ulong)tx[i];
+    ulong y   = (ulong)ty[i];
+    ulong qk  = 0;
+    int   s   = 2 * (zoom - 1);
+    for (int j = zoom - 1; j >= 0; j--) {
+        ulong digit = ((x >> j) & 1UL) | (((y >> j) & 1UL) << 1);
+        qk |= digit << s;
+        s   -= 2;
     }
     oqk[i] = qk;
 }
@@ -182,8 +204,8 @@ __kernel void quadkey_decode_batch(
     size_t i = get_global_id(0);
     if (i >= n) return;
 
-    int x = 0, y = 0;
     ulong q = qk[i];
+    int   x = 0, y = 0;
     for (int j = 0; j < zoom; j++) {
         int digit = (int)((q >> (2 * (zoom - 1 - j))) & 3UL);
         int mask  = 1 << (zoom - 1 - j);
@@ -280,7 +302,7 @@ __kernel void bounding_tile_batch(
     double latn = _clamp_lat(north[i]) * D2R;
 
     ox[i] = (int)floor((west[i] + 180.0) / 360.0 * z2);
-    oy[i] = (int)floor((1.0 - log(tan(HALF_PI + latn * 0.5)) / PI) * 0.5 * z2);
+    oy[i] = (int)floor((1.0 - log(tan(QUARTER_PI + latn * 0.5)) / PI) * 0.5 * z2);
 }
 
 /* ---- 13. Grid-fill: enumerate tiles in a bbox ------------- */
