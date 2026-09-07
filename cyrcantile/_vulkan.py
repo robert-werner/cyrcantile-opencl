@@ -68,12 +68,16 @@ _MAX_LAT = 85.05112878
 _MAX_LNG = 180.0
 
 
+# NOTE: All WGSL shaders use f32 storage buffers (f64 requires the
+# shader-f64 feature which many devices lack).  The precision is
+# sufficient for tile operations through zoom 20.
+
 def _clamp_src():
     return (
-        f"fn clamp_lat(p: f64) -> f64 {{ if p > {_MAX_LAT} {{ return {_MAX_LAT}; }} "
-        f"if p < -{_MAX_LAT} {{ return -{_MAX_LAT}; }} return p; }}\n"
-        f"fn clamp_lng(l: f64) -> f64 {{ if l > {_MAX_LNG} {{ return {_MAX_LNG}; }} "
-        f"if l < -{_MAX_LNG} {{ return -{_MAX_LNG}; }} return l; }}\n"
+        f"fn clamp_lat(p: f32) -> f32 {{ if p > f32({_MAX_LAT}) {{ return f32({_MAX_LAT}); }} "
+        f"if p < f32(-{_MAX_LAT}) {{ return f32(-{_MAX_LAT}); }} return p; }}\n"
+        f"fn clamp_lng(l: f32) -> f32 {{ if l > f32({_MAX_LNG}) {{ return f32({_MAX_LNG}); }} "
+        f"if l < f32(-{_MAX_LNG}) {{ return f32(-{_MAX_LNG}); }} return l; }}\n"
     )
 
 
@@ -88,10 +92,10 @@ _WGSL = {
         + _FLAT_IDX_SRC
         + _clamp_src()
         + """
-@group(0) @binding(0) var<storage, read> lng: array<f64>;
-@group(0) @binding(1) var<storage, read> lat: array<f64>;
-@group(0) @binding(2) var<storage, read_write> ox: array<f64>;
-@group(0) @binding(3) var<storage, read_write> oy: array<f64>;
+@group(0) @binding(0) var<storage, read> lng: array<f32>;
+@group(0) @binding(1) var<storage, read> lat: array<f32>;
+@group(0) @binding(2) var<storage, read_write> ox: array<f32>;
+@group(0) @binding(3) var<storage, read_write> oy: array<f32>;
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = flat_id(gid);
@@ -109,10 +113,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         _UNIFORM_PREAMBLE
         + _FLAT_IDX_SRC
         + """
-@group(0) @binding(0) var<storage, read> x: array<f64>;
-@group(0) @binding(1) var<storage, read> y: array<f64>;
-@group(0) @binding(2) var<storage, read_write> olng: array<f64>;
-@group(0) @binding(3) var<storage, read_write> olat: array<f64>;
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> y: array<f32>;
+@group(0) @binding(2) var<storage, read_write> olng: array<f32>;
+@group(0) @binding(3) var<storage, read_write> olat: array<f32>;
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = flat_id(gid);
@@ -127,8 +131,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         + _FLAT_IDX_SRC
         + _clamp_src()
         + """
-@group(0) @binding(0) var<storage, read> lng: array<f64>;
-@group(0) @binding(1) var<storage, read> lat: array<f64>;
+@group(0) @binding(0) var<storage, read> lng: array<f32>;
+@group(0) @binding(1) var<storage, read> lat: array<f32>;
 @group(0) @binding(2) var<storage, read_write> ox: array<i32>;
 @group(0) @binding(3) var<storage, read_write> oy: array<i32>;
 @compute @workgroup_size(256)
@@ -139,7 +143,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var p = lat[i];
     if (u[0].y != 0) { l = clamp_lng(l); p = clamp_lat(p); }
     p = p * __D2R__;
-    let z2 = exp2(f64(u[0].x));
+    let z2 = exp2(f32(u[0].x));
     ox[i] = i32(floor((l + 180.0) / 360.0 * z2));
     oy[i] = i32(floor(__TY__ * z2));
 }
@@ -151,15 +155,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         + """
 @group(0) @binding(0) var<storage, read> tx: array<i32>;
 @group(0) @binding(1) var<storage, read> ty: array<i32>;
-@group(0) @binding(2) var<storage, read_write> olng: array<f64>;
-@group(0) @binding(3) var<storage, read_write> olat: array<f64>;
+@group(0) @binding(2) var<storage, read_write> olng: array<f32>;
+@group(0) @binding(3) var<storage, read_write> olat: array<f32>;
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = flat_id(gid);
     if (i >= u[0].y) { return; }
-    let z2 = exp2(f64(u[0].x));
-    olng[i] = f64(tx[i]) / z2 * 360.0 - 180.0;
-    olat[i] = atan(sinh(__PI__ * (1.0 - 2.0 * f64(ty[i]) / z2))) * __R2D__;
+    let z2 = exp2(f32(u[0].x));
+    olng[i] = f32(tx[i]) / z2 * 360.0 - 180.0;
+    olat[i] = atan(sinh(__PI__ * (1.0 - 2.0 * f32(ty[i]) / z2))) * __R2D__;
 }
 """.replace("__PI__", str(_PI)).replace("__R2D__", str(_R2D))
     ),
@@ -169,19 +173,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         + """
 @group(0) @binding(0) var<storage, read> tx: array<i32>;
 @group(0) @binding(1) var<storage, read> ty: array<i32>;
-@group(0) @binding(2) var<storage, read_write> ow: array<f64>;
-@group(0) @binding(3) var<storage, read_write> os: array<f64>;
-@group(0) @binding(4) var<storage, read_write> oe: array<f64>;
-@group(0) @binding(5) var<storage, read_write> on: array<f64>;
+@group(0) @binding(2) var<storage, read_write> ow: array<f32>;
+@group(0) @binding(3) var<storage, read_write> os: array<f32>;
+@group(0) @binding(4) var<storage, read_write> oe: array<f32>;
+@group(0) @binding(5) var<storage, read_write> on: array<f32>;
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = flat_id(gid);
     if (i >= u[0].y) { return; }
-    let z2 = exp2(f64(u[0].x));
-    ow[i] = f64(tx[i]) / z2 * 360.0 - 180.0;
-    oe[i] = f64(tx[i] + 1) / z2 * 360.0 - 180.0;
-    on[i] = atan(sinh(__PI__ * (1.0 - 2.0 * f64(ty[i]) / z2))) * __R2D__;
-    os[i] = atan(sinh(__PI__ * (1.0 - 2.0 * (f64(ty[i]) + 1.0) / z2))) * __R2D__;
+    let z2 = exp2(f32(u[0].x));
+    ow[i] = f32(tx[i]) / z2 * 360.0 - 180.0;
+    oe[i] = f32(tx[i] + 1) / z2 * 360.0 - 180.0;
+    on[i] = atan(sinh(__PI__ * (1.0 - 2.0 * f32(ty[i]) / z2))) * __R2D__;
+    os[i] = atan(sinh(__PI__ * (1.0 - 2.0 * (f32(ty[i]) + 1.0) / z2))) * __R2D__;
 }
 """.replace("__PI__", str(_PI)).replace("__R2D__", str(_R2D))
     ),
@@ -191,19 +195,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         + """
 @group(0) @binding(0) var<storage, read> tx: array<i32>;
 @group(0) @binding(1) var<storage, read> ty: array<i32>;
-@group(0) @binding(2) var<storage, read_write> ol: array<f64>;
-@group(0) @binding(3) var<storage, read_write> ob: array<f64>;
-@group(0) @binding(4) var<storage, read_write> orr: array<f64>;
-@group(0) @binding(5) var<storage, read_write> ot: array<f64>;
+@group(0) @binding(2) var<storage, read_write> ol: array<f32>;
+@group(0) @binding(3) var<storage, read_write> ob: array<f32>;
+@group(0) @binding(4) var<storage, read_write> orr: array<f32>;
+@group(0) @binding(5) var<storage, read_write> ot: array<f32>;
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = flat_id(gid);
     if (i >= u[0].y) { return; }
-    let z2 = exp2(f64(u[0].x));
+    let z2 = exp2(f32(u[0].x));
     let ts = __CE__ / z2;
-    ol[i] = f64(tx[i]) * ts - __CE__ * 0.5;
+    ol[i] = f32(tx[i]) * ts - __CE__ * 0.5;
     orr[i] = ol[i] + ts;
-    ot[i] = __CE__ * 0.5 - f64(ty[i]) * ts;
+    ot[i] = __CE__ * 0.5 - f32(ty[i]) * ts;
     ob[i] = ot[i] - ts;
 }
 """.replace("__CE__", str(_CE))
@@ -337,17 +341,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         + _FLAT_IDX_SRC
         + _clamp_src()
         + """
-@group(0) @binding(0) var<storage, read> west: array<f64>;
-@group(0) @binding(1) var<storage, read> south: array<f64>;
-@group(0) @binding(2) var<storage, read> east: array<f64>;
-@group(0) @binding(3) var<storage, read> north: array<f64>;
+@group(0) @binding(0) var<storage, read> west: array<f32>;
+@group(0) @binding(1) var<storage, read> south: array<f32>;
+@group(0) @binding(2) var<storage, read> east: array<f32>;
+@group(0) @binding(3) var<storage, read> north: array<f32>;
 @group(0) @binding(4) var<storage, read_write> ox: array<i32>;
 @group(0) @binding(5) var<storage, read_write> oy: array<i32>;
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = flat_id(gid);
     if (i >= u[0].y) { return; }
-    let z2 = exp2(f64(u[0].x));
+    let z2 = exp2(f32(u[0].x));
     let latn = clamp_lat(north[i]) * __D2R__;
     ox[i] = i32(floor((west[i] + 180.0) / 360.0 * z2));
     oy[i] = i32(floor(__TY__ * z2));
@@ -388,8 +392,8 @@ class VulkanBackend:
         if not HAS_VULKAN or _adapter is None:
             raise RuntimeError("No Vulkan (wgpu) adapter available")
         features = set(_adapter.features)
-        required = {"shader-f64"}
         self.has_u64 = "shader-int64" in features
+        required = set()
         if self.has_u64:
             required.add("shader-int64")
         self.device = _adapter.request_device_sync(
@@ -467,34 +471,34 @@ class VulkanBackend:
         return in_bufs, n
 
     def xy(self, lng, lat, truncate=False):
-        lng = np.ascontiguousarray(lng, np.float64)
-        lat = np.ascontiguousarray(lat, np.float64)
+        lng = np.ascontiguousarray(lng, np.float32)
+        lat = np.ascontiguousarray(lat, np.float32)
         n = lng.shape[0]
         bl = self._upload(lng)
         ba = self._upload(lat)
-        bo = self._out(n * 8)
-        by = self._out(n * 8)
+        bo = self._out(n * 4)
+        by = self._out(n * 4)
         bu = self._uni([1 if truncate else 0, n])
         self._dispatch("xy", [(0, 0, bl), (1, 0, ba), (2, 0, bo), (3, 0, by),
                               (20, 0, bu)], n)
-        return self._read(bo, np.float64, n), self._read(by, np.float64, n)
+        return self._read(bo, np.float32, n).astype(np.float64), self._read(by, np.float32, n).astype(np.float64)
 
     def lnglat(self, x, y):
-        x = np.ascontiguousarray(x, np.float64)
-        y = np.ascontiguousarray(y, np.float64)
+        x = np.ascontiguousarray(x, np.float32)
+        y = np.ascontiguousarray(y, np.float32)
         n = x.shape[0]
         bx = self._upload(x)
         by = self._upload(y)
-        bo = self._out(n * 8)
-        bl = self._out(n * 8)
+        bo = self._out(n * 4)
+        bl = self._out(n * 4)
         bu = self._uni([n])
         self._dispatch("lnglat", [(0, 0, bx), (1, 0, by), (2, 0, bo), (3, 0, bl),
                                   (20, 0, bu)], n)
-        return self._read(bo, np.float64, n), self._read(bl, np.float64, n)
+        return self._read(bo, np.float32, n).astype(np.float64), self._read(bl, np.float32, n).astype(np.float64)
 
     def tile(self, lng, lat, zoom, truncate=False):
-        lng = np.ascontiguousarray(lng, np.float64)
-        lat = np.ascontiguousarray(lat, np.float64)
+        lng = np.ascontiguousarray(lng, np.float32)
+        lat = np.ascontiguousarray(lat, np.float32)
         n = lng.shape[0]
         bl = self._upload(lng)
         ba = self._upload(lat)
@@ -511,12 +515,12 @@ class VulkanBackend:
         n = tx.shape[0]
         bx = self._upload(tx)
         by = self._upload(ty)
-        bo = self._out(n * 8)
-        bl = self._out(n * 8)
+        bo = self._out(n * 4)
+        bl = self._out(n * 4)
         bu = self._uni([zoom, n])
         self._dispatch("ul", [(0, 0, bx), (1, 0, by), (2, 0, bo), (3, 0, bl),
                               (20, 0, bu)], n)
-        return self._read(bo, np.float64, n), self._read(bl, np.float64, n)
+        return self._read(bo, np.float32, n).astype(np.float64), self._read(bl, np.float32, n).astype(np.float64)
 
     def bounds(self, tx, ty, zoom):
         tx = np.ascontiguousarray(tx, np.int32)
@@ -524,16 +528,16 @@ class VulkanBackend:
         n = tx.shape[0]
         bx = self._upload(tx)
         by = self._upload(ty)
-        bw = self._out(n * 8)
-        bs = self._out(n * 8)
-        be = self._out(n * 8)
-        bn = self._out(n * 8)
+        bw = self._out(n * 4)
+        bs = self._out(n * 4)
+        be = self._out(n * 4)
+        bn = self._out(n * 4)
         bu = self._uni([zoom, n])
         self._dispatch("bounds", [(0, 0, bx), (1, 0, by), (2, 0, bw),
                                   (3, 0, bs), (4, 0, be), (5, 0, bn),
                                   (20, 0, bu)], n)
-        return (self._read(bw, np.float64, n), self._read(bs, np.float64, n),
-                self._read(be, np.float64, n), self._read(bn, np.float64, n))
+        return (self._read(bw, np.float32, n).astype(np.float64), self._read(bs, np.float32, n).astype(np.float64),
+                self._read(be, np.float32, n).astype(np.float64), self._read(bn, np.float32, n).astype(np.float64))
 
     def xy_bounds(self, tx, ty, zoom):
         tx = np.ascontiguousarray(tx, np.int32)
@@ -541,16 +545,16 @@ class VulkanBackend:
         n = tx.shape[0]
         bx = self._upload(tx)
         by = self._upload(ty)
-        bl = self._out(n * 8)
-        bb = self._out(n * 8)
-        br = self._out(n * 8)
-        bt = self._out(n * 8)
+        bl = self._out(n * 4)
+        bb = self._out(n * 4)
+        br = self._out(n * 4)
+        bt = self._out(n * 4)
         bu = self._uni([zoom, n])
         self._dispatch("xy_bounds", [(0, 0, bx), (1, 0, by), (2, 0, bl),
                                      (3, 0, bb), (4, 0, br), (5, 0, bt),
                                      (20, 0, bu)], n)
-        return (self._read(bl, np.float64, n), self._read(bb, np.float64, n),
-                self._read(br, np.float64, n), self._read(bt, np.float64, n))
+        return (self._read(bl, np.float32, n).astype(np.float64), self._read(bb, np.float32, n).astype(np.float64),
+                self._read(br, np.float32, n).astype(np.float64), self._read(bt, np.float32, n).astype(np.float64))
 
     def quadkey_encode(self, tx, ty, zoom):
         if not self.has_u64:
@@ -619,10 +623,10 @@ class VulkanBackend:
         return self._read(bo, np.int32, n * 8), self._read(byy, np.int32, n * 8)
 
     def bounding_tile(self, west, south, east, north, zoom):
-        west = np.ascontiguousarray(west, np.float64)
-        south = np.ascontiguousarray(south, np.float64)
-        east = np.ascontiguousarray(east, np.float64)
-        north = np.ascontiguousarray(north, np.float64)
+        west = np.ascontiguousarray(west, np.float32)
+        south = np.ascontiguousarray(south, np.float32)
+        east = np.ascontiguousarray(east, np.float32)
+        north = np.ascontiguousarray(north, np.float32)
         n = west.shape[0]
         bw = self._upload(west)
         bs = self._upload(south)
