@@ -1,0 +1,65 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cyrcantile"
+version = "0.3.0"
+description = "GPU-accelerated spherical-mercator tile utilities (OpenCL / Vulkan / CUDA)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "cyrcantile contributors" }]
+keywords = ["tiles", "mercator", "web-mercator", "xyz", "quadkey", "opencl", "gpu"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: GIS",
+]
+dependencies = [
+    "numpy>=1.21",
+]
+
+[project.optional-dependencies]
+opencl = ["pyopencl>=2021.1"]
+vulkan = ["wgpu>=0.17"]
+cuda = ["numba>=0.60"]
+cpu-speed = ["numba>=0.60"]
+cli = ["click>=8.0"]
+test = ["pytest>=7", "mercantile>=1.2", "click>=8.0"]
+dev = ["pytest>=7", "mercantile>=1.2", "ruff>=0.4", "click>=8.0"]
+
+[project.scripts]
+cyrcantile = "cyrcantile.scripts:cli"
+
+[tool.setuptools]
+packages = ["cyrcantile"]
+
+[tool.setuptools.package-data]
+cyrcantile = ["_kernels.cl", "py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# WGSL shader sources are embedded as long strings.
+"cyrcantile/_vulkan.py" = ["E501"]
+# importorskip() must run before the imports under test.
+"tests/*" = ["E402"]

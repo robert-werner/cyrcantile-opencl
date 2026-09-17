@@ -1,6 +1,6 @@
-# cyrcantile/_kernels.cl
-# OpenCL kernels for spherical-mercator tile computations.
-# Ported from the Cython _base.pyx to GPU-parallel batch kernels.
+// cyrcantile/_kernels.cl
+// OpenCL kernels for spherical-mercator tile computations.
+// Ported from the Cython _base.pyx to GPU-parallel batch kernels.
 
 #define PI       3.14159265358979323846
 #define HALF_PI  1.57079632679489661923
@@ -11,6 +11,7 @@
 #define CE       40075016.68557849
 #define MAX_LAT  85.05112878
 #define MAX_LNG  180.0
+#define EPSILON  1e-14
 
 /* ---- helpers -------------------------------------------------- */
 /* Branch-based clamps are faster than fmin/fmax on most GPUs and,
@@ -71,6 +72,8 @@ __kernel void lnglat_batch(
 }
 
 /* ---- 3. Geographic -> Tile (x, y) at *zoom* ----------------- */
+/* Mercantile-compatible: indices are clamped into [0, 2^zoom - 1]
+   and an EPSILON nudge pulls right-edge points into the next tile. */
 
 __kernel void tile_batch(
     __global const double *lng,
@@ -90,11 +93,21 @@ __kernel void tile_batch(
         l = _clamp_lng(l);
         p = _clamp_lat(p);
     }
-    p *= D2R;
+    double x = l / 360.0 + 0.5;
+    double sinlat = sin(p * D2R);
+    double y = 0.5 - 0.25 * log((1.0 + sinlat) / (1.0 - sinlat)) / PI;
     double z2 = exp2((double)zoom);
 
-    ox[i] = (int)floor((l + 180.0) / 360.0 * z2);
-    oy[i] = (int)floor((1.0 - log(tan(QUARTER_PI + p * 0.5)) / PI) * 0.5 * z2);
+    int xt, yt;
+    if (x <= 0.0)      xt = 0;
+    else if (x >= 1.0) xt = (int)z2 - 1;
+    else               xt = (int)floor((x + EPSILON) * z2);
+    if (y <= 0.0)      yt = 0;
+    else if (y >= 1.0) yt = (int)z2 - 1;
+    else               yt = (int)floor((y + EPSILON) * z2);
+
+    ox[i] = xt;
+    oy[i] = yt;
 }
 
 /* ---- 4. Tile -> Upper-Left corner (lng, lat) --------------- */
@@ -216,29 +229,30 @@ __kernel void quadkey_decode_batch(
     oy[i] = y;
 }
 
-/* ---- 9. Tile -> Parent tile ------------------------------- */
+/* ---- 9. Tile -> Ancestor at `shift` zoom levels up --------- */
+/* shift == 0 is the identity (used by target-zoom == source-zoom). */
 
 __kernel void parent_batch(
     __global const int *tx,
     __global const int *ty,
     __global int *ox,
     __global int *oy,
-    const int  zoom,
+    const int  shift,
     const ulong n
 ) {
     size_t i = get_global_id(0);
     if (i >= n) return;
 
-    if (zoom == 0) {
+    if (shift <= 0) {
         ox[i] = tx[i];
         oy[i] = ty[i];
     } else {
-        ox[i] = tx[i] >> 1;
-        oy[i] = ty[i] >> 1;
+        ox[i] = tx[i] >> shift;
+        oy[i] = ty[i] >> shift;
     }
 }
 
-/* ---- 10. Tile -> 4 Children -------------------------------- */
+/* ---- 10. Tile -> 4 Children (TL, TR, BR, BL — mercantile order) -- */
 
 __kernel void children_batch(
     __global const int *tx,
@@ -255,11 +269,14 @@ __kernel void children_batch(
 
     ox[i*4+0] = x2;     oy[i*4+0] = y2;
     ox[i*4+1] = x2 + 1; oy[i*4+1] = y2;
-    ox[i*4+2] = x2;     oy[i*4+2] = y2 + 1;
-    ox[i*4+3] = x2 + 1; oy[i*4+3] = y2 + 1;
+    ox[i*4+2] = x2 + 1; oy[i*4+2] = y2 + 1;
+    ox[i*4+3] = x2;     oy[i*4+3] = y2 + 1;
 }
 
-/* ---- 11. Tile -> 8 Neighbours (NW,N,NE,W,E,SW,S,SE) ------- */
+/* ---- 11. Tile -> 8 Neighbours, x-major, unfiltered --------------- */
+/* Order: (x-1,y-1), (x-1,y), (x-1,y+1), (x,y-1), (x,y+1),
+          (x+1,y-1), (x+1,y), (x+1,y+1).  Out-of-grid neighbours are
+          returned as-is; the scalar API filters them (mercantile). */
 
 __kernel void neighbors_batch(
     __global const int *tx,
@@ -274,21 +291,21 @@ __kernel void neighbors_batch(
     int x = tx[i], y = ty[i];
 
     ox[i*8+0] = x-1; oy[i*8+0] = y-1;
-    ox[i*8+1] = x;   oy[i*8+1] = y-1;
-    ox[i*8+2] = x+1; oy[i*8+2] = y-1;
-    ox[i*8+3] = x-1; oy[i*8+3] = y;
-    ox[i*8+4] = x+1; oy[i*8+4] = y;
-    ox[i*8+5] = x-1; oy[i*8+5] = y+1;
-    ox[i*8+6] = x;   oy[i*8+6] = y+1;
+    ox[i*8+1] = x-1; oy[i*8+1] = y;
+    ox[i*8+2] = x-1; oy[i*8+2] = y+1;
+    ox[i*8+3] = x;   oy[i*8+3] = y-1;
+    ox[i*8+4] = x;   oy[i*8+4] = y+1;
+    ox[i*8+5] = x+1; oy[i*8+5] = y-1;
+    ox[i*8+6] = x+1; oy[i*8+6] = y;
     ox[i*8+7] = x+1; oy[i*8+7] = y+1;
 }
 
 /* ---- 12. Bounding-tile NW corner for a geographic bbox ----- */
+/* Only the west and north edges are needed (mercantile semantics:
+   the bounding tile at a given zoom is the tile of the NW corner). */
 
 __kernel void bounding_tile_batch(
     __global const double *west,
-    __global const double *south,
-    __global const double *east,
     __global const double *north,
     __global int *ox,
     __global int *oy,
@@ -298,11 +315,21 @@ __kernel void bounding_tile_batch(
     size_t i = get_global_id(0);
     if (i >= n) return;
 
-    double z2   = exp2((double)zoom);
-    double latn = _clamp_lat(north[i]) * D2R;
+    double x = west[i] / 360.0 + 0.5;
+    double sinlat = sin(_clamp_lat(north[i]) * D2R);
+    double y = 0.5 - 0.25 * log((1.0 + sinlat) / (1.0 - sinlat)) / PI;
+    double z2 = exp2((double)zoom);
 
-    ox[i] = (int)floor((west[i] + 180.0) / 360.0 * z2);
-    oy[i] = (int)floor((1.0 - log(tan(QUARTER_PI + latn * 0.5)) / PI) * 0.5 * z2);
+    int xt, yt;
+    if (x <= 0.0)      xt = 0;
+    else if (x >= 1.0) xt = (int)z2 - 1;
+    else               xt = (int)floor((x + EPSILON) * z2);
+    if (y <= 0.0)      yt = 0;
+    else if (y >= 1.0) yt = (int)z2 - 1;
+    else               yt = (int)floor((y + EPSILON) * z2);
+
+    ox[i] = xt;
+    oy[i] = yt;
 }
 
 /* ---- 13. Grid-fill: enumerate tiles in a bbox ------------- */

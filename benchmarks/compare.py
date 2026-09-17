@@ -1,9 +1,9 @@
 """Head-to-head benchmark: cyrcantile vs mercantile vs supermercado.
 
 Compares the three libraries on identical workloads:
-  - xy        : lng/lat → Web Mercator
-  - tile      : lng/lat → tile x/y
-  - lnglat    : Web Mercator → lng/lat  (cyrcantile only — mercantile lacks it)
+  - xy        : lng/lat -> Web Mercator
+  - tile      : lng/lat -> tile x/y
+  - lnglat    : Web Mercator -> lng/lat  (cyrcantile only - mercantile lacks it)
   - edge      : edge detection on a boolean grid
 
 Run from repo root:
@@ -19,7 +19,52 @@ import time
 
 import numpy as np
 
-# ── constants ──────────────────────────────────────────────────────
+try:
+    from numba import njit, prange
+
+    HAS_NUMBA = True
+except ImportError:
+    HAS_NUMBA = False
+
+if HAS_NUMBA:
+    @njit(parallel=True, cache=True)
+    def _edge_mask_numba(burn):
+        """True where a burned cell touches an unburned neighbour
+        (8-connectivity) - a Numba stand-in for the old gigamercado
+        edge detector, measuring the same stencil work."""
+        h, w = burn.shape
+        edge = np.zeros((h, w), dtype=np.bool_)
+        for i in prange(h):
+            for j in range(w):
+                if burn[i, j] == 0:
+                    continue
+                e = False
+                for di in (-1, 0, 1):
+                    for dj in (-1, 0, 1):
+                        if di == 0 and dj == 0:
+                            continue
+                        ii = i + di
+                        jj = j + dj
+                        if 0 <= ii < h and 0 <= jj < w and burn[ii, jj] == 0:
+                            e = True
+                if e:
+                    edge[i, j] = True
+        return edge
+
+
+def numba_edge(burn, xmin, ymin, zoom):
+    if not HAS_NUMBA:
+        raise RuntimeError("numba is not installed")
+    edge = _edge_mask_numba(burn)
+    coords = np.argwhere(edge)
+    if coords.shape[0] == 0:
+        return np.empty((0, 3), dtype=np.int32)
+    coords[:, 0] += xmin - 1
+    coords[:, 1] += ymin - 1
+    return np.column_stack((coords, np.full(len(coords), zoom, dtype=np.int64)))
+
+
+# -- constants ------------------------------------------------------
 
 PI = np.pi
 RE = 6378137.0
@@ -29,12 +74,12 @@ HALF_PI = PI / 2.0
 QPI = PI / 4.0
 
 
-# ── helpers ────────────────────────────────────────────────────────
+# -- helpers --------------------------------------------------------
 
 def banner(msg: str) -> None:
-    print(f"\n{'─' * 64}")
+    print(f"\n{'-' * 64}")
     print(f"  {msg}")
-    print(f"{'─' * 64}")
+    print(f"{'-' * 64}")
 
 
 def timer(fn, repeat: int = 3, warmup: int = 1) -> float:
@@ -47,7 +92,7 @@ def timer(fn, repeat: int = 3, warmup: int = 1) -> float:
     return (time.perf_counter() - t0) / repeat * 1000
 
 
-# ── test data ──────────────────────────────────────────────────────
+# -- test data ------------------------------------------------------
 
 def make_points(n: int, seed: int = 42):
     rng = np.random.RandomState(seed)
@@ -71,7 +116,7 @@ def make_edge_grid(grid_side: int = 1024, seed: int = 42):
     return burn, -512, -512, 12
 
 
-# ── pure-NumPy baselines ──────────────────────────────────────────
+# -- pure-NumPy baselines ------------------------------------------
 
 def np_xy(lngs, lats):
     x = RE * lngs * D2R
@@ -109,18 +154,19 @@ def np_edge(burn, xmin, ymin, zoom):
     return np.column_stack((coords, np.full(len(coords), zoom, dtype=np.uint8)))
 
 
-# ── benchmarks ─────────────────────────────────────────────────────
+# -- benchmarks -----------------------------------------------------
 
 def bench_xy(lngs, lats, repeat: int):
-    import cyrcantile as ct
     import mercantile
+
+    import cyrcantile as ct
 
     n = len(lngs)
     banner(f"xy  ({n:,} points)")
 
     results = {}
 
-    # mercantile — scalar loop
+    # mercantile - scalar loop
     def _merc():
         for i in range(n):
             mercantile.xy(lngs[i], lats[i])
@@ -150,15 +196,16 @@ def bench_xy(lngs, lats, repeat: int):
 
 
 def bench_tile(lngs, lats, zoom: int, repeat: int):
-    import cyrcantile as ct
     import mercantile
+
+    import cyrcantile as ct
 
     n = len(lngs)
     banner(f"tile  ({n:,} points, z={zoom})")
 
     results = {}
 
-    # mercantile — scalar loop
+    # mercantile - scalar loop
     def _merc():
         for i in range(n):
             mercantile.tile(lngs[i], lats[i], zoom)
@@ -222,7 +269,7 @@ def bench_edge(burn, xmin, ymin, zoom, repeat: int):
     import supermercado.edge_finder as ef
 
     grid = burn.shape[0]
-    banner(f"edge_stencil  ({grid}×{grid} grid)")
+    banner(f"edge_stencil  ({grid}x{grid} grid)")
 
     results = {}
 
@@ -231,7 +278,7 @@ def bench_edge(burn, xmin, ymin, zoom, repeat: int):
     results["NumPy"] = t
     print(f"  NumPy          {t:10.2f} ms")
 
-    # supermercado (original) — needs JSON string tiles
+    # supermercado (original) - needs JSON string tiles
     tile_strings = []
     for r in range(burn.shape[0]):
         for c in range(burn.shape[1]):
@@ -244,29 +291,26 @@ def bench_edge(burn, xmin, ymin, zoom, repeat: int):
     except Exception as e:
         print(f"  supermercado   (failed: {e})")
 
-    # cyrcantile (Numba accelerated)
+    # numba stencil (cyrcantile-style accelerated edge detection)
     try:
-        from gigamercado._accel import edge_detect
-
-        # warm up JIT
-        edge_detect(burn, xmin, ymin, zoom)
-        t = timer(lambda: edge_detect(burn, xmin, ymin, zoom), repeat)
-        results["cyrcantile"] = t
-        print(f"  cyrcantile     {t:10.2f} ms  (Numba parallel)")
+        numba_edge(burn, xmin, ymin, zoom)  # warm up JIT
+        t = timer(lambda: numba_edge(burn, xmin, ymin, zoom), repeat)
+        results["Numba"] = t
+        print(f"  Numba          {t:10.2f} ms  (parallel stencil)")
     except Exception as e:
-        print(f"  cyrcantile     (failed: {e})")
+        print(f"  Numba          (failed: {e})")
 
     return results
 
 
-# ── summary ────────────────────────────────────────────────────────
+# -- summary --------------------------------------------------------
 
 def print_summary(all_results: dict):
     banner("SPEEDUP SUMMARY")
-    backends = ["mercantile", "NumPy", "cyrcantile(1)", "cyrcantile", "supermercado"]
+    backends = ["mercantile", "NumPy", "cyrcantile(1)", "cyrcantile", "supermercado", "Numba"]
     header = f"{'Operation':<16}" + "".join(f"{b:>15}" for b in backends)
     print(header)
-    print("─" * len(header))
+    print("-" * len(header))
 
     for op, res in all_results.items():
         # Use mercantile as baseline when present, otherwise NumPy
@@ -280,13 +324,13 @@ def print_summary(all_results: dict):
                     speedup = base / res[b]
                     cols += f"{speedup:>14.1f}x"
             else:
-                cols += f"{'—':>15}"
+                cols += f"{'-':>15}"
         print(f"{op:<16}{cols}")
 
     banner("ABSOLUTE TIMES (ms)")
     header = f"{'Operation':<16}" + "".join(f"{b:>15}" for b in backends)
     print(header)
-    print("─" * len(header))
+    print("-" * len(header))
 
     for op, res in all_results.items():
         cols = ""
@@ -294,11 +338,11 @@ def print_summary(all_results: dict):
             if b in res:
                 cols += f"{res[b]:>14.1f}"
             else:
-                cols += f"{'—':>15}"
+                cols += f"{'-':>15}"
         print(f"{op:<16}{cols}")
 
 
-# ── main ──────────────────────────────────────────────────────────
+# -- main ----------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(
@@ -318,7 +362,7 @@ def main():
     n, grid, repeat = args.size, args.grid, args.repeat
 
     banner("benchmark: cyrcantile vs mercantile vs supermercado")
-    print(f"  points = {n:,}   grid = {grid}×{grid}   repeat = {repeat}")
+    print(f"  points = {n:,}   grid = {grid}x{grid}   repeat = {repeat}")
 
     lngs, lats = make_points(n)
     xs, ys = make_merc(n)
@@ -345,7 +389,7 @@ def main():
     else:
         ops[args.operation]()
 
-    print(f"\n  Done ✓\n")
+    print("\n  Done OK\n")
 
 
 if __name__ == "__main__":

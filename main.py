@@ -1,8 +1,21 @@
-"""Demo & micro-benchmark for cyrcantile OpenCL backend."""
+"""Demo & micro-benchmark for cyrcantile backends.
 
+Usage:
+    python main.py
+    python main.py --size 100_000_000 --zoom 12
+    python main.py --backends opencl,vulkan,cuda --backends-cpu false
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
 import time
+
 import numpy as np
+
 import cyrcantile as ct
+from cyrcantile import _cpu
 
 
 def banner(msg):
@@ -44,145 +57,119 @@ def demo_single():
     print(f"  bounding_tile(bbox)            = {bt}")
 
 
-def demo_batch():
-    banner("BATCH API (GPU path)")
-    print(f"  OpenCL available: {ct.HAS_OPENCL}")
-
+def make_data(n, zoom):
     np.random.seed(42)
-    n = 100_000
     lons = np.random.uniform(-180, 180, n)
     lats = np.random.uniform(-85, 85, n)
-    zoom = 12
-
-    if ct.HAS_OPENCL:
-        t0 = time.perf_counter()
-        xs, ys = ct.tile(lons, lats, zoom)
-        gpu_ms = (time.perf_counter() - t0) * 1000
-        print(f"  GPU tile_batch({n:,} pts, z={zoom})  = {gpu_ms:.1f} ms")
-    else:
-        print("  (OpenCL not available — skipping GPU benchmark)")
-
-    from cyrcantile import _cpu
-    t0 = time.perf_counter()
-    xs_c, ys_c = _cpu.tile_vec(lons, lats, zoom)
-    cpu_ms = (time.perf_counter() - t0) * 1000
-    print(f"  CPU tile_vec({n:,} pts, z={zoom})  = {cpu_ms:.1f} ms")
-
-    if ct.HAS_OPENCL:
-        match = np.array_equal(xs, xs_c) and np.array_equal(ys, ys_c)
-        print(f"  GPU == CPU results: {match}")
+    return lons, lats, zoom
 
 
-def demo_batch_vulkan():
-    banner("BATCH API — Vulkan backend")
+def bench_backend(name, run, lons, lats, zoom):
+    """Run one GPU batch benchmark; returns (ms, xs, ys) or (None, None, None)."""
+    if run is None:
+        print(f"  {name} available: False - skipping")
+        return None, None, None
     try:
-        from cyrcantile._vulkan import get_backend as vk_get_backend, HAS_VULKAN
-    except Exception:
-        HAS_VULKAN = False
-        vk_get_backend = None
-    print(f"  Vulkan available: {HAS_VULKAN}")
+        # warmup (also compiles kernels / pipelines)
+        run(lons[:4096], lats[:4096], zoom)
+        t0 = time.perf_counter()
+        xs, ys = run(lons, lats, zoom)
+        gpu_ms = (time.perf_counter() - t0) * 1000
+        n = lons.shape[0]
+        print(f"  {name} tile({n:,} pts, z={zoom}) = {gpu_ms:.1f} ms")
+        return gpu_ms, xs, ys
+    except Exception as e:
+        print(f"  ({name} benchmark failed: {e})")
+        return None, None, None
 
-    np.random.seed(42)
-    # 8M points: large enough to be a meaningful batch benchmark while each
-    # f64 input buffer (64 MB) stays under the typical per-binding limit of
-    # 128 MB (max_storage_buffer_binding_size) seen on llvmpipe.
-    n = 8_000_000
-    lons = np.random.uniform(-180, 180, n)
-    lats = np.random.uniform(-85, 85, n)
-    zoom = 12
 
-    if HAS_VULKAN and vk_get_backend is not None:
-        try:
-            vk = vk_get_backend()
-            # warmup (also compiles the pipeline)
-            vk.tile(lons[:4096], lats[:4096], zoom)
-            t0 = time.perf_counter()
-            xs, ys = vk.tile(lons, lats, zoom)
-            gpu_ms = (time.perf_counter() - t0) * 1000
-            print(f"  Vulkan tile({n:,} pts, z={zoom}) = {gpu_ms:.1f} ms")
-        except Exception as e:
-            print(f"  (Vulkan benchmark failed: {e})")
-            gpu_ms = xs = ys = None
-    else:
-        print("  (Vulkan not available — skipping Vulkan benchmark)")
-        gpu_ms = xs = ys = None
-
-    from cyrcantile import _cpu
+def cpu_reference(lons, lats, zoom, label="CPU"):
+    # warm up the numba JIT (needs >= _THREAD_THRESHOLD elements to
+    # select the JIT engine) so the timed call excludes compilation
+    nwarm = min(len(lons), 250_000)
+    _cpu.tile_vec(lons[:nwarm], lats[:nwarm], zoom)
     t0 = time.perf_counter()
     xs_c, ys_c = _cpu.tile_vec(lons, lats, zoom)
     cpu_ms = (time.perf_counter() - t0) * 1000
-    print(f"  CPU tile_vec({n:,} pts, z={zoom})  = {cpu_ms:.1f} ms")
+    print(f"  {label} tile_vec({lons.shape[0]:,} pts, z={zoom})  = {cpu_ms:.1f} ms")
+    return xs_c, ys_c
 
+
+def demo_batch(lons, lats, zoom, backends):
+    banner("BATCH API (auto-dispatch)")
+    print(f"  active backend: {ct.ACTIVE_BACKEND}   OpenCL available: {ct.HAS_OPENCL}")
+
+    gpu_ms = xs = ys = None
+    if "opencl" in backends and ct._backend is not None:
+        gpu_ms, xs, ys = bench_backend("OpenCL", ct._backend.tile, lons, lats, zoom)
+
+    xs_c, ys_c = cpu_reference(lons, lats, zoom)
     if xs is not None:
         match = np.array_equal(xs, xs_c) and np.array_equal(ys, ys_c)
-        print(f"  Vulkan == CPU results: {match}")
+        print(f"  OpenCL == CPU results: {match}")
 
 
-def demo_batch_cuda():
-    banner("BATCH API — CUDA backend")
+def demo_batch_vulkan(lons, lats, zoom, backends):
+    if "vulkan" not in backends:
+        return
     try:
-        from cyrcantile._cuda import get_backend as cuda_get_backend, HAS_CUDA
+        from cyrcantile._vulkan import HAS_VULKAN
+        from cyrcantile._vulkan import get_backend as vk_get_backend
     except Exception:
-        HAS_CUDA = False
-        cuda_get_backend = None
+        HAS_VULKAN, vk_get_backend = False, None
+
+    banner("BATCH API - Vulkan backend")
+    print(f"  Vulkan available: {HAS_VULKAN}")
+    backend = vk_get_backend() if (HAS_VULKAN and vk_get_backend) else None
+    run = backend.tile if backend is not None else None
+    gpu_ms, xs, ys = bench_backend("Vulkan", run, lons, lats, zoom)
+
+    xs_c, ys_c = cpu_reference(lons, lats, zoom)
+    if xs is not None:
+        # Vulkan computes in f32: tile indices may flip at floor boundaries.
+        mism = int(np.count_nonzero(xs != xs_c) + np.count_nonzero(ys != ys_c))
+        print(f"  Vulkan vs CPU: {mism}/{2 * len(xs)} indices differ (f32 boundaries)")
+
+
+def demo_batch_cuda(lons, lats, zoom, backends):
+    if "cuda" not in backends:
+        return
+    try:
+        from cyrcantile._cuda import HAS_CUDA
+        from cyrcantile._cuda import get_backend as cuda_get_backend
+    except Exception:
+        HAS_CUDA, cuda_get_backend = False, None
+
+    banner("BATCH API - CUDA backend")
     print(f"  CUDA available: {HAS_CUDA}")
+    backend = cuda_get_backend() if (HAS_CUDA and cuda_get_backend) else None
+    run = backend.tile if backend is not None else None
+    gpu_ms, xs, ys = bench_backend("CUDA", run, lons, lats, zoom)
 
-    np.random.seed(42)
-    n = 8_000_000
-    lons = np.random.uniform(-180, 180, n)
-    lats = np.random.uniform(-85, 85, n)
-    zoom = 12
-
-    if HAS_CUDA and cuda_get_backend is not None:
-        try:
-            cu = cuda_get_backend()
-            # warmup (compiles the JIT kernels)
-            cu.tile(lons[:4096], lats[:4096], zoom)
-            t0 = time.perf_counter()
-            xs, ys = cu.tile(lons, lats, zoom)
-            gpu_ms = (time.perf_counter() - t0) * 1000
-            print(f"  CUDA tile({n:,} pts, z={zoom}) = {gpu_ms:.1f} ms")
-        except Exception as e:
-            print(f"  (CUDA benchmark failed: {e})")
-            gpu_ms = xs = ys = None
-    else:
-        print("  (CUDA not available — skipping CUDA benchmark)")
-        gpu_ms = xs = ys = None
-
-    from cyrcantile import _cpu
-    t0 = time.perf_counter()
-    xs_c, ys_c = _cpu.tile_vec(lons, lats, zoom)
-    cpu_ms = (time.perf_counter() - t0) * 1000
-    print(f"  CPU tile_vec({n:,} pts, z={zoom})  = {cpu_ms:.1f} ms")
-
+    xs_c, ys_c = cpu_reference(lons, lats, zoom)
     if xs is not None:
         match = np.array_equal(xs, xs_c) and np.array_equal(ys, ys_c)
         print(f"  CUDA == CPU results: {match}")
 
 
-def demo_cpu_parallel():
+def demo_cpu_parallel(lons, lats, zoom, enabled):
+    if not enabled:
+        return
     banner("CPU PARALLEL BENCHMARK")
-    from cyrcantile import _cpu
     print(f"  Numba available: {ct.HAS_NUMBA}   CPU workers: {_cpu._CPU_WORKERS}")
-
-    np.random.seed(42)
-    n = 8_000_000
-    lons = np.random.uniform(-180, 180, n)
-    lats = np.random.uniform(-85, 85, n)
-    zoom = 12
 
     # warmup (compiles numba kernels / first pass)
     _cpu.tile_vec(lons[:4096], lats[:4096], zoom)
 
-    engine = _cpu._choose_engine(n)
+    engine = _cpu._choose_engine(lons.shape[0])
     t0 = time.perf_counter()
     xs_c, ys_c = _cpu.tile_vec(lons, lats, zoom)
     cpu_ms = (time.perf_counter() - t0) * 1000
-    print(f"  CPU tile_vec({n:,} pts, z={zoom})  = {cpu_ms:.1f} ms  (engine: {engine})")
+    print(f"  CPU tile_vec({lons.shape[0]:,} pts, z={zoom})  = {cpu_ms:.1f} ms  (engine: {engine})")
 
     # single-thread reference for the speedup ratio
     t0 = time.perf_counter()
-    _cpu._tile_chunk(lons, lats, zoom, False, 0, n)
+    _cpu._tile_chunk(lons, lats, zoom, False, 0, lons.shape[0])
     single_ms = (time.perf_counter() - t0) * 1000
     print(f"  CPU single-thread              = {single_ms:.1f} ms")
     print(f"  parallel speedup               = {single_ms / cpu_ms:.2f}x")
@@ -193,7 +180,7 @@ def demo_tiles_in_bbox():
     west, south, east, north = -9.5, 53.0, -9.0, 53.3
     result = ct.tiles(west, south, east, north, [14, 15, 16])
     print(f"  bbox({west}, {south}, {east}, {north})")
-    print(f"  zooms [14, 15, 16] → {len(result)} tiles")
+    print(f"  zooms [14, 15, 16] -> {len(result)} tiles")
     if result:
         print(f"  first: {result[0]}  last: {result[-1]}")
 
@@ -202,16 +189,34 @@ def demo_feature():
     banner("GEOJSON FEATURE")
     t = ct.tile(-9.14, 53.12, 10)
     feat = ct.feature(t, fid=1, props={"name": "demo"})
-    import json
     print(json.dumps(feat, indent=2)[:400] + " ...")
 
 
-if __name__ == "__main__":
+def main():
+    parser = argparse.ArgumentParser(description="cyrcantile demo & benchmark")
+    parser.add_argument("--size", type=int, default=8_000_000,
+                        help="points per batch benchmark (default 8,000,000)")
+    parser.add_argument("--zoom", type=int, default=12, help="zoom level (default 12)")
+    parser.add_argument("--backends", default="opencl,vulkan,cuda",
+                        help="comma-separated GPU backends to benchmark")
+    parser.add_argument("--cpu-parallel", dest="cpu_parallel",
+                        action=argparse.BooleanOptionalAction, default=True,
+                        help="also run the CPU parallel benchmark")
+    args = parser.parse_args()
+
     demo_single()
-    demo_batch()
-    demo_batch_vulkan()
-    demo_batch_cuda()
-    demo_cpu_parallel()
+
+    lons, lats, zoom = make_data(args.size, args.zoom)
+    backends = [b.strip().lower() for b in args.backends.split(",") if b.strip()]
+
+    demo_batch(lons, lats, zoom, backends)
+    demo_batch_vulkan(lons, lats, zoom, backends)
+    demo_batch_cuda(lons, lats, zoom, backends)
+    demo_cpu_parallel(lons, lats, zoom, args.cpu_parallel)
     demo_tiles_in_bbox()
     demo_feature()
     print("\nDone.")
+
+
+if __name__ == "__main__":
+    main()

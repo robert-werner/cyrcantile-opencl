@@ -1,5 +1,3 @@
 numpy>=1.21
-pyopencl>=2021.1
-numba>=0.60
-wgpu>=0.17
-
+pytest>=7
+ruff>=0.4

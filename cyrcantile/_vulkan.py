@@ -5,13 +5,15 @@ them with Vulkan compute shaders written in WGSL.  The shaders are
 translated to SPIR-V by wgpu's bundled Naga compiler, so no external
 glslc / glslang toolchain is required.
 
-Unlike the OpenCL backend this module is imported lazily: ``wgpu`` and the
-Vulkan ICD are only loaded when a Vulkan device is actually requested, so a
-missing ``wgpu`` installation or missing AMD/Mesa Vulkan driver simply means
-``HAS_VULKAN`` stays ``False`` and the public API falls back gracefully.
+Unlike the OpenCL backend this module is imported lazily: ``wgpu`` and
+the Vulkan ICD are only loaded when a Vulkan device is actually
+requested, so a missing ``wgpu`` installation or missing Vulkan driver
+simply means ``HAS_VULKAN`` stays ``False`` and callers fall back
+gracefully.
 
-AMD GPUs are exposed through Mesa's ``RADV`` (``libvulkan_radeon``) on
-Linux; any other Vulkan ICD is equally supported.
+All WGSL shaders use f32 storage buffers (f64 requires the shader-f64
+feature which many devices lack).  The precision is sufficient for tile
+operations through zoom 20; see the README for the llvmpipe caveat.
 """
 
 from __future__ import annotations
@@ -20,7 +22,10 @@ import numpy as np
 
 try:
     import wgpu
-    import wgpu.backends.auto  # noqa: F401 - loads the native backend
+    try:
+        import wgpu.backends.auto  # noqa: F401 - old wgpu needs it; new one does not
+    except ImportError:
+        pass  # modern wgpu selects the native backend automatically
     HAS_WGPU = True
 except Exception:
     HAS_WGPU = False
@@ -41,7 +46,7 @@ except Exception:
 _UNIFORM_BINDING = 20
 
 _UNIFORM_PREAMBLE = (
-    "@group(0) @binding(%d) var<uniform> u: array<vec4<i32>, 2>;\n" % _UNIFORM_BINDING
+    f"@group(0) @binding({_UNIFORM_BINDING}) var<uniform> u: array<vec4<i32>, 2>;\n"
 )
 
 # The compute grid is 2D: each row covers this many threads (a non-zero
@@ -66,11 +71,10 @@ _RE = 6378137.0
 _CE = 40075016.68557849
 _MAX_LAT = 85.05112878
 _MAX_LNG = 180.0
+# NOTE: at f32 precision x + EPSILON == x, so the mercantile nudge is a
+# no-op here; kept only for structural parity with the other backends.
+_EPSILON = 1e-14
 
-
-# NOTE: All WGSL shaders use f32 storage buffers (f64 requires the
-# shader-f64 feature which many devices lack).  The precision is
-# sufficient for tile operations through zoom 20.
 
 def _clamp_src():
     return (
@@ -81,8 +85,23 @@ def _clamp_src():
     )
 
 
-def _tile_y(p: str) -> str:
-    return f"(1.0 - log(tan({_QUARTER_PI} + {p} * 0.5)) / {_PI}) * 0.5"
+def _tile_idx_src() -> str:
+    """Mercantile-compatible tile indices: clamp + EPSILON nudge."""
+    return (
+        "fn tile_idx_x(l: f32, z2: f32) -> i32 {\n"
+        "    let x = l / 360.0 + 0.5;\n"
+        "    if (x <= 0.0) { return 0; }\n"
+        "    if (x >= 1.0) { return i32(z2) - 1; }\n"
+        "    return i32(floor((x + __EPS__) * z2));\n"
+        "}\n"
+        "fn tile_idx_y(p: f32, z2: f32) -> i32 {\n"
+        "    let sinlat = sin(p * __D2R__);\n"
+        "    let y = 0.5 - 0.25 * log((1.0 + sinlat) / (1.0 - sinlat)) / __PI__;\n"
+        "    if (y <= 0.0) { return 0; }\n"
+        "    if (y >= 1.0) { return i32(z2) - 1; }\n"
+        "    return i32(floor((y + __EPS__) * z2));\n"
+        "}\n"
+    ).replace("__D2R__", str(_D2R)).replace("__PI__", str(_PI)).replace("__EPS__", str(_EPSILON))
 
 
 # Per-kernel WGSL.  Uniform slots (u[i]) are documented per kernel.
@@ -130,6 +149,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         _UNIFORM_PREAMBLE
         + _FLAT_IDX_SRC
         + _clamp_src()
+        + _tile_idx_src()
         + """
 @group(0) @binding(0) var<storage, read> lng: array<f32>;
 @group(0) @binding(1) var<storage, read> lat: array<f32>;
@@ -142,12 +162,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var l = lng[i];
     var p = lat[i];
     if (u[0].y != 0) { l = clamp_lng(l); p = clamp_lat(p); }
-    p = p * __D2R__;
     let z2 = exp2(f32(u[0].x));
-    ox[i] = i32(floor((l + 180.0) / 360.0 * z2));
-    oy[i] = i32(floor(__TY__ * z2));
+    ox[i] = tile_idx_x(l, z2);
+    oy[i] = tile_idx_y(p, z2);
 }
-""".replace("__D2R__", str(_D2R)).replace("__TY__", _tile_y("p"))
+"""
     ),
     "ul": (
         _UNIFORM_PREAMBLE
@@ -212,6 +231,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 """.replace("__CE__", str(_CE))
     ),
+    # NOTE: quadkey kernels require the shader-int64 device feature; the
+    # backend raises NotImplementedError instead of dispatching when the
+    # feature is missing.  Abstract-int literals ("0", "1", "3") are used
+    # deliberately so they adopt the u64 type of the other operand.
     "quadkey_encode": (
         _UNIFORM_PREAMBLE
         + _FLAT_IDX_SRC
@@ -226,11 +249,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let zoom = u[0].x;
     var x: u64 = u64(tx[i]);
     var y: u64 = u64(ty[i]);
-    var q: u64 = 0u;
+    var q: u64 = 0;
     var s: i32 = 2 * (zoom - 1);
     var j: i32 = zoom - 1;
     while (j >= 0) {
-        let d = ((x >> u32(j)) & 1u) | (((y >> u32(j)) & 1u) << 1u);
+        let d = ((x >> u32(j)) & 1) | (((y >> u32(j)) & 1) << 1);
         q = q | (d << u32(s));
         s = s - 2;
         j = j - 1;
@@ -252,22 +275,23 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (i >= u[0].y) { return; }
     let zoom = u[0].x;
     let q = qk[i];
-    var x: i32 = 0;
-    var y: i32 = 0;
+    var x: u64 = 0;
+    var y: u64 = 0;
     var j: i32 = 0;
     while (j < zoom) {
-        let shift = 2 * (zoom - 1 - j);
-        let digit = i32((q >> u32(shift)) & 3u);
-        let mask = 1 << (zoom - 1 - j);
-        if (digit & 1) != 0 { x = x | mask; }
-        if (digit & 2) != 0 { y = y | mask; }
+        let k = zoom - 1 - j;
+        let sh = u32(2 * k);
+        let bk = u32(k);
+        if (((q >> sh) & 1) != 0) { x = x | (u64(1) << bk); }
+        if (((q >> sh) & 2) != 0) { y = y | (u64(1) << bk); }
         j = j + 1;
     }
-    ox[i] = x;
-    oy[i] = y;
+    ox[i] = i32(x);
+    oy[i] = i32(y);
 }
 """
     ),
+    # u[0].x = shift (0 = identity, 1 = immediate parent, ...)
     "parent": (
         _UNIFORM_PREAMBLE
         + _FLAT_IDX_SRC
@@ -280,10 +304,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = flat_id(gid);
     if (i >= u[0].y) { return; }
-    if (u[0].x == 0) {
+    let s = u32(u[0].x);
+    if (s == 0u) {
         ox[i] = tx[i]; oy[i] = ty[i];
     } else {
-        ox[i] = tx[i] >> 1; oy[i] = ty[i] >> 1;
+        ox[i] = tx[i] >> s; oy[i] = ty[i] >> s;
     }
 }
 """
@@ -303,13 +328,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let x2 = tx[i] << 1;
     let y2 = ty[i] << 1;
     let k = i * 4;
+    // mercantile order: top-left, top-right, bottom-right, bottom-left
     ox[k]     = x2;     oy[k]     = y2;
     ox[k + 1] = x2 + 1; oy[k + 1] = y2;
-    ox[k + 2] = x2;     oy[k + 2] = y2 + 1;
-    ox[k + 3] = x2 + 1; oy[k + 3] = y2 + 1;
+    ox[k + 2] = x2 + 1; oy[k + 2] = y2 + 1;
+    ox[k + 3] = x2;     oy[k + 3] = y2 + 1;
 }
 """
     ),
+    # x-major order, unfiltered (the scalar API filters invalid neighbours)
     "neighbors": (
         _UNIFORM_PREAMBLE
         + _FLAT_IDX_SRC
@@ -326,37 +353,37 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let y = ty[i];
     let k = i * 8;
     ox[k]     = x - 1; oy[k]     = y - 1;
-    ox[k + 1] = x;     oy[k + 1] = y - 1;
-    ox[k + 2] = x + 1; oy[k + 2] = y - 1;
-    ox[k + 3] = x - 1; oy[k + 3] = y;
-    ox[k + 4] = x + 1; oy[k + 4] = y;
-    ox[k + 5] = x - 1; oy[k + 5] = y + 1;
-    ox[k + 6] = x;     oy[k + 6] = y + 1;
+    ox[k + 1] = x - 1; oy[k + 1] = y;
+    ox[k + 2] = x - 1; oy[k + 2] = y + 1;
+    ox[k + 3] = x;     oy[k + 3] = y - 1;
+    ox[k + 4] = x;     oy[k + 4] = y + 1;
+    ox[k + 5] = x + 1; oy[k + 5] = y - 1;
+    ox[k + 6] = x + 1; oy[k + 6] = y;
     ox[k + 7] = x + 1; oy[k + 7] = y + 1;
 }
 """
     ),
+    # Only west/north are needed: the bounding tile at a given zoom is the
+    # tile of the bbox north-west corner (mercantile semantics).
     "bounding_tile": (
         _UNIFORM_PREAMBLE
         + _FLAT_IDX_SRC
         + _clamp_src()
+        + _tile_idx_src()
         + """
 @group(0) @binding(0) var<storage, read> west: array<f32>;
-@group(0) @binding(1) var<storage, read> south: array<f32>;
-@group(0) @binding(2) var<storage, read> east: array<f32>;
-@group(0) @binding(3) var<storage, read> north: array<f32>;
-@group(0) @binding(4) var<storage, read_write> ox: array<i32>;
-@group(0) @binding(5) var<storage, read_write> oy: array<i32>;
+@group(0) @binding(1) var<storage, read> north: array<f32>;
+@group(0) @binding(2) var<storage, read_write> ox: array<i32>;
+@group(0) @binding(3) var<storage, read_write> oy: array<i32>;
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = flat_id(gid);
     if (i >= u[0].y) { return; }
     let z2 = exp2(f32(u[0].x));
-    let latn = clamp_lat(north[i]) * __D2R__;
-    ox[i] = i32(floor((west[i] + 180.0) / 360.0 * z2));
-    oy[i] = i32(floor(__TY__ * z2));
+    ox[i] = tile_idx_x(west[i], z2);
+    oy[i] = tile_idx_y(clamp_lat(north[i]), z2);
 }
-""".replace("__D2R__", str(_D2R)).replace("__TY__", _tile_y("latn"))
+"""
     ),
     "tiles_in_bbox": (
         _UNIFORM_PREAMBLE
@@ -376,10 +403,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 
+def _require_u64(method_name):
+    raise NotImplementedError(
+        f"Vulkan device {_adapter.info['device'] if _adapter else ''!r} "
+        f"lacks the shader-int64 feature required by {method_name}(); "
+        f"use the OpenCL/CUDA backend or the CPU fallback"
+    )
+
+
 class VulkanBackend:
     """Lazily-initialised singleton wrapping a Vulkan device + cached pipelines."""
 
-    _instance: "VulkanBackend | None" = None
+    _instance: VulkanBackend | None = None
 
     def __new__(cls):
         if cls._instance is None:
@@ -421,7 +456,7 @@ class VulkanBackend:
         """buffers: list of 3-tuples (binding, kind, gpubuffer)."""
         pipe = self._pipe(key)
         bindings = []
-        for binding, kind, buf in buffers:
+        for binding, _kind, buf in buffers:
             resource = {"buffer": buf, "offset": 0, "size": buf.size}
             bindings.append({"binding": binding, "resource": resource})
         bind_group = self.device.create_bind_group(
@@ -464,16 +499,12 @@ class VulkanBackend:
 
     # -- batch operations ------------------------------------------
 
-    def _common_io(self, key, inputs, dtype, out_n, uni):
-        in_bufs = [self._upload(np.ascontiguousarray(a, dtype))
-                   for a in inputs]
-        n = out_n
-        return in_bufs, n
-
     def xy(self, lng, lat, truncate=False):
         lng = np.ascontiguousarray(lng, np.float32)
         lat = np.ascontiguousarray(lat, np.float32)
         n = lng.shape[0]
+        if n == 0:
+            return np.empty(0, dtype=np.float64), np.empty(0, dtype=np.float64)
         bl = self._upload(lng)
         ba = self._upload(lat)
         bo = self._out(n * 4)
@@ -481,12 +512,15 @@ class VulkanBackend:
         bu = self._uni([1 if truncate else 0, n])
         self._dispatch("xy", [(0, 0, bl), (1, 0, ba), (2, 0, bo), (3, 0, by),
                               (20, 0, bu)], n)
-        return self._read(bo, np.float32, n).astype(np.float64), self._read(by, np.float32, n).astype(np.float64)
+        return (self._read(bo, np.float32, n).astype(np.float64),
+                self._read(by, np.float32, n).astype(np.float64))
 
     def lnglat(self, x, y):
         x = np.ascontiguousarray(x, np.float32)
         y = np.ascontiguousarray(y, np.float32)
         n = x.shape[0]
+        if n == 0:
+            return np.empty(0, dtype=np.float64), np.empty(0, dtype=np.float64)
         bx = self._upload(x)
         by = self._upload(y)
         bo = self._out(n * 4)
@@ -494,12 +528,15 @@ class VulkanBackend:
         bu = self._uni([n])
         self._dispatch("lnglat", [(0, 0, bx), (1, 0, by), (2, 0, bo), (3, 0, bl),
                                   (20, 0, bu)], n)
-        return self._read(bo, np.float32, n).astype(np.float64), self._read(bl, np.float32, n).astype(np.float64)
+        return (self._read(bo, np.float32, n).astype(np.float64),
+                self._read(bl, np.float32, n).astype(np.float64))
 
     def tile(self, lng, lat, zoom, truncate=False):
         lng = np.ascontiguousarray(lng, np.float32)
         lat = np.ascontiguousarray(lat, np.float32)
         n = lng.shape[0]
+        if n == 0:
+            return np.empty(0, dtype=np.int32), np.empty(0, dtype=np.int32)
         bl = self._upload(lng)
         ba = self._upload(lat)
         bo = self._out(n * 4)
@@ -513,6 +550,8 @@ class VulkanBackend:
         tx = np.ascontiguousarray(tx, np.int32)
         ty = np.ascontiguousarray(ty, np.int32)
         n = tx.shape[0]
+        if n == 0:
+            return np.empty(0, dtype=np.float64), np.empty(0, dtype=np.float64)
         bx = self._upload(tx)
         by = self._upload(ty)
         bo = self._out(n * 4)
@@ -520,12 +559,15 @@ class VulkanBackend:
         bu = self._uni([zoom, n])
         self._dispatch("ul", [(0, 0, bx), (1, 0, by), (2, 0, bo), (3, 0, bl),
                               (20, 0, bu)], n)
-        return self._read(bo, np.float32, n).astype(np.float64), self._read(bl, np.float32, n).astype(np.float64)
+        return (self._read(bo, np.float32, n).astype(np.float64),
+                self._read(bl, np.float32, n).astype(np.float64))
 
     def bounds(self, tx, ty, zoom):
         tx = np.ascontiguousarray(tx, np.int32)
         ty = np.ascontiguousarray(ty, np.int32)
         n = tx.shape[0]
+        if n == 0:
+            return tuple(np.empty(0, dtype=np.float64) for _ in range(4))
         bx = self._upload(tx)
         by = self._upload(ty)
         bw = self._out(n * 4)
@@ -536,13 +578,15 @@ class VulkanBackend:
         self._dispatch("bounds", [(0, 0, bx), (1, 0, by), (2, 0, bw),
                                   (3, 0, bs), (4, 0, be), (5, 0, bn),
                                   (20, 0, bu)], n)
-        return (self._read(bw, np.float32, n).astype(np.float64), self._read(bs, np.float32, n).astype(np.float64),
-                self._read(be, np.float32, n).astype(np.float64), self._read(bn, np.float32, n).astype(np.float64))
+        return tuple(self._read(b, np.float32, n).astype(np.float64)
+                     for b in (bw, bs, be, bn))
 
     def xy_bounds(self, tx, ty, zoom):
         tx = np.ascontiguousarray(tx, np.int32)
         ty = np.ascontiguousarray(ty, np.int32)
         n = tx.shape[0]
+        if n == 0:
+            return tuple(np.empty(0, dtype=np.float64) for _ in range(4))
         bx = self._upload(tx)
         by = self._upload(ty)
         bl = self._out(n * 4)
@@ -553,15 +597,17 @@ class VulkanBackend:
         self._dispatch("xy_bounds", [(0, 0, bx), (1, 0, by), (2, 0, bl),
                                      (3, 0, bb), (4, 0, br), (5, 0, bt),
                                      (20, 0, bu)], n)
-        return (self._read(bl, np.float32, n).astype(np.float64), self._read(bb, np.float32, n).astype(np.float64),
-                self._read(br, np.float32, n).astype(np.float64), self._read(bt, np.float32, n).astype(np.float64))
+        return tuple(self._read(b, np.float32, n).astype(np.float64)
+                     for b in (bl, bb, br, bt))
 
     def quadkey_encode(self, tx, ty, zoom):
         if not self.has_u64:
-            return None
+            _require_u64("quadkey_encode")
         tx = np.ascontiguousarray(tx, np.int32)
         ty = np.ascontiguousarray(ty, np.int32)
         n = tx.shape[0]
+        if n == 0:
+            return np.empty(0, dtype=np.uint64)
         bx = self._upload(tx)
         by = self._upload(ty)
         bq = self._out(n * 8)
@@ -572,9 +618,11 @@ class VulkanBackend:
 
     def quadkey_decode(self, qk, zoom):
         if not self.has_u64:
-            return None
+            _require_u64("quadkey_decode")
         qk = np.ascontiguousarray(qk, np.uint64)
         n = qk.shape[0]
+        if n == 0:
+            return np.empty(0, dtype=np.int32), np.empty(0, dtype=np.int32)
         bq = self._upload(qk)
         bo = self._out(n * 4)
         by = self._out(n * 4)
@@ -583,15 +631,18 @@ class VulkanBackend:
                                           (20, 0, bu)], n)
         return self._read(bo, np.int32, n), self._read(by, np.int32, n)
 
-    def parent(self, tx, ty, zoom):
+    def parent(self, tx, ty, shift):
+        """Ancestor of each tile at ``shift`` zoom levels up."""
         tx = np.ascontiguousarray(tx, np.int32)
         ty = np.ascontiguousarray(ty, np.int32)
         n = tx.shape[0]
+        if n == 0:
+            return np.empty(0, dtype=np.int32), np.empty(0, dtype=np.int32)
         bx = self._upload(tx)
         by = self._upload(ty)
         bo = self._out(n * 4)
         byy = self._out(n * 4)
-        bu = self._uni([zoom, n])
+        bu = self._uni([shift, n])
         self._dispatch("parent", [(0, 0, bx), (1, 0, by), (2, 0, bo), (3, 0, byy),
                                   (20, 0, bu)], n)
         return self._read(bo, np.int32, n), self._read(byy, np.int32, n)
@@ -600,6 +651,8 @@ class VulkanBackend:
         tx = np.ascontiguousarray(tx, np.int32)
         ty = np.ascontiguousarray(ty, np.int32)
         n = tx.shape[0]
+        if n == 0:
+            return np.empty(0, dtype=np.int32), np.empty(0, dtype=np.int32)
         bx = self._upload(tx)
         by = self._upload(ty)
         bo = self._out(n * 4 * 4)
@@ -613,6 +666,8 @@ class VulkanBackend:
         tx = np.ascontiguousarray(tx, np.int32)
         ty = np.ascontiguousarray(ty, np.int32)
         n = tx.shape[0]
+        if n == 0:
+            return np.empty(0, dtype=np.int32), np.empty(0, dtype=np.int32)
         bx = self._upload(tx)
         by = self._upload(ty)
         bo = self._out(n * 8 * 4)
@@ -622,21 +677,20 @@ class VulkanBackend:
                                      (20, 0, bu)], n)
         return self._read(bo, np.int32, n * 8), self._read(byy, np.int32, n * 8)
 
-    def bounding_tile(self, west, south, east, north, zoom):
+    def bounding_tile(self, west, north, zoom):
+        """Tile of the bbox north-west corner at *zoom* (only w/n are used)."""
         west = np.ascontiguousarray(west, np.float32)
-        south = np.ascontiguousarray(south, np.float32)
-        east = np.ascontiguousarray(east, np.float32)
         north = np.ascontiguousarray(north, np.float32)
         n = west.shape[0]
+        if n == 0:
+            return np.empty(0, dtype=np.int32), np.empty(0, dtype=np.int32)
         bw = self._upload(west)
-        bs = self._upload(south)
-        be = self._upload(east)
         bn = self._upload(north)
         bo = self._out(n * 4)
         by = self._out(n * 4)
         bu = self._uni([zoom, n])
-        self._dispatch("bounding_tile", [(0, 0, bw), (1, 0, bs), (2, 0, be),
-                                         (3, 0, bn), (4, 0, bo), (5, 0, by),
+        self._dispatch("bounding_tile", [(0, 0, bw), (1, 0, bn),
+                                         (2, 0, bo), (3, 0, by),
                                          (20, 0, bu)], n)
         return self._read(bo, np.int32, n), self._read(by, np.int32, n)
 

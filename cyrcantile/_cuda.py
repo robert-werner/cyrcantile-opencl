@@ -35,6 +35,7 @@ _RE = 6378137.0
 _CE = 40075016.68557849
 _MAX_LAT = 85.05112878
 _MAX_LNG = 180.0
+_EPSILON = 1e-14
 
 _THREADS = 256
 
@@ -53,12 +54,12 @@ def _clamp_lat_dev(p):
 
 
 @cuda.jit(device=True)
-def _clamp_lng_dev(l):
-    if l > _MAX_LNG:
+def _clamp_lng_dev(lng):
+    if lng > _MAX_LNG:
         return _MAX_LNG
-    if l < -_MAX_LNG:
+    if lng < -_MAX_LNG:
         return -_MAX_LNG
-    return l
+    return lng
 
 
 @cuda.jit
@@ -66,13 +67,12 @@ def _xy_kernel(lng, lat, ox, oy, truncate, n):
     i = cuda.grid(1)
     if i >= n:
         return
-    l = lng[i]
+    lo = lng[i]
     p = lat[i]
     if truncate:
-        l = _clamp_lng_dev(l)
+        lo = _clamp_lng_dev(lo)
         p = _clamp_lat_dev(p)
-    p = p * _D2R
-    ox[i] = _RE * l * _D2R
+    ox[i] = _RE * lo * _D2R
     oy[i] = _RE * math.log(math.tan(_QUARTER_PI + p * 0.5))
 
 
@@ -90,16 +90,29 @@ def _tile_kernel(lng, lat, ox, oy, zoom, truncate, n):
     i = cuda.grid(1)
     if i >= n:
         return
-    l = lng[i]
+    lo = lng[i]
     p = lat[i]
     if truncate:
-        l = _clamp_lng_dev(l)
+        lo = _clamp_lng_dev(lo)
         p = _clamp_lat_dev(p)
-    p = p * _D2R
+    x = lo / 360.0 + 0.5
+    sinlat = math.sin(p * _D2R)
+    y = 0.5 - 0.25 * math.log((1.0 + sinlat) / (1.0 - sinlat)) / _PI
     z2 = 2.0 ** zoom
-    ox[i] = int(math.floor((l + 180.0) / 360.0 * z2))
-    oy[i] = int(math.floor((1.0 - math.log(math.tan(_QUARTER_PI + p * 0.5)) / _PI)
-                           * 0.5 * z2))
+    if x <= 0.0:
+        xt = 0
+    elif x >= 1.0:
+        xt = int(z2) - 1
+    else:
+        xt = int(math.floor((x + _EPSILON) * z2))
+    if y <= 0.0:
+        yt = 0
+    elif y >= 1.0:
+        yt = int(z2) - 1
+    else:
+        yt = int(math.floor((y + _EPSILON) * z2))
+    ox[i] = xt
+    oy[i] = yt
 
 
 @cuda.jit
@@ -174,16 +187,16 @@ def _quadkey_decode_kernel(qk, ox, oy, zoom, n):
 
 
 @cuda.jit
-def _parent_kernel(tx, ty, ox, oy, zoom, n):
+def _parent_kernel(tx, ty, ox, oy, shift, n):
     i = cuda.grid(1)
     if i >= n:
         return
-    if zoom == 0:
+    if shift <= 0:
         ox[i] = tx[i]
         oy[i] = ty[i]
     else:
-        ox[i] = tx[i] >> 1
-        oy[i] = ty[i] >> 1
+        ox[i] = tx[i] >> shift
+        oy[i] = ty[i] >> shift
 
 
 @cuda.jit
@@ -193,13 +206,14 @@ def _children_kernel(tx, ty, ox, oy, n):
         return
     x2 = tx[i] << 1
     y2 = ty[i] << 1
+    # mercantile order: top-left, top-right, bottom-right, bottom-left
     ox[i * 4 + 0] = x2
     oy[i * 4 + 0] = y2
     ox[i * 4 + 1] = x2 + 1
     oy[i * 4 + 1] = y2
-    ox[i * 4 + 2] = x2
+    ox[i * 4 + 2] = x2 + 1
     oy[i * 4 + 2] = y2 + 1
-    ox[i * 4 + 3] = x2 + 1
+    ox[i * 4 + 3] = x2
     oy[i * 4 + 3] = y2 + 1
 
 
@@ -210,34 +224,48 @@ def _neighbors_kernel(tx, ty, ox, oy, n):
         return
     x = tx[i]
     y = ty[i]
+    # x-major order, unfiltered (scalar API filters invalid neighbours)
     ox[i * 8 + 0] = x - 1
     oy[i * 8 + 0] = y - 1
-    ox[i * 8 + 1] = x
-    oy[i * 8 + 1] = y - 1
-    ox[i * 8 + 2] = x + 1
-    oy[i * 8 + 2] = y - 1
-    ox[i * 8 + 3] = x - 1
-    oy[i * 8 + 3] = y
-    ox[i * 8 + 4] = x + 1
-    oy[i * 8 + 4] = y
-    ox[i * 8 + 5] = x - 1
-    oy[i * 8 + 5] = y + 1
-    ox[i * 8 + 6] = x
-    oy[i * 8 + 6] = y + 1
+    ox[i * 8 + 1] = x - 1
+    oy[i * 8 + 1] = y
+    ox[i * 8 + 2] = x - 1
+    oy[i * 8 + 2] = y + 1
+    ox[i * 8 + 3] = x
+    oy[i * 8 + 3] = y - 1
+    ox[i * 8 + 4] = x
+    oy[i * 8 + 4] = y + 1
+    ox[i * 8 + 5] = x + 1
+    oy[i * 8 + 5] = y - 1
+    ox[i * 8 + 6] = x + 1
+    oy[i * 8 + 6] = y
     ox[i * 8 + 7] = x + 1
     oy[i * 8 + 7] = y + 1
 
 
 @cuda.jit
-def _bounding_tile_kernel(west, south, east, north, ox, oy, zoom, n):
+def _bounding_tile_kernel(west, north, ox, oy, zoom, n):
     i = cuda.grid(1)
     if i >= n:
         return
+    x = west[i] / 360.0 + 0.5
+    sinlat = math.sin(_clamp_lat_dev(north[i]) * _D2R)
+    y = 0.5 - 0.25 * math.log((1.0 + sinlat) / (1.0 - sinlat)) / _PI
     z2 = 2.0 ** zoom
-    latn = _clamp_lat_dev(north[i]) * _D2R
-    ox[i] = int(math.floor((west[i] + 180.0) / 360.0 * z2))
-    oy[i] = int(math.floor((1.0 - math.log(math.tan(_QUARTER_PI + latn * 0.5)) / _PI)
-                           * 0.5 * z2))
+    if x <= 0.0:
+        xt = 0
+    elif x >= 1.0:
+        xt = int(z2) - 1
+    else:
+        xt = int(math.floor((x + _EPSILON) * z2))
+    if y <= 0.0:
+        yt = 0
+    elif y >= 1.0:
+        yt = int(z2) - 1
+    else:
+        yt = int(math.floor((y + _EPSILON) * z2))
+    ox[i] = xt
+    oy[i] = yt
 
 
 @cuda.jit
@@ -256,7 +284,7 @@ def _tiles_in_bbox_kernel(ox, oy, min_x, min_y, grid_w, n):
 class CudaBackend:
     """Singleton wrapper dispatching batch operations to CUDA kernels."""
 
-    _instance: "CudaBackend | None" = None
+    _instance: CudaBackend | None = None
 
     def __new__(cls):
         if cls._instance is None:
@@ -273,8 +301,12 @@ class CudaBackend:
 
     # -- helpers --------------------------------------------------
 
-    def _blocks(self, n):
-        return (n + _THREADS - 1) // _THREADS
+    def _launch(self, kernel, n, *args):
+        """Launch *kernel* over n elements; skips empty batches (CUDA
+        rejects zero-sized grids)."""
+        if n <= 0:
+            return
+        kernel[self._blocks(n), _THREADS](*args)
 
     # -- batch operations ------------------------------------------
 
@@ -286,8 +318,9 @@ class CudaBackend:
         d_lat = cuda.to_device(lat)
         d_ox = cuda.device_array(n, dtype=np.float64)
         d_oy = cuda.device_array(n, dtype=np.float64)
-        _xy_kernel[self._blocks(n), _THREADS](
-            d_lng, d_lat, d_ox, d_oy, np.int32(1 if truncate else 0), np.uint64(n))
+        self._launch(_xy_kernel, n,
+                     d_lng, d_lat, d_ox, d_oy,
+                     np.int32(1 if truncate else 0), np.uint64(n))
         return d_ox.copy_to_host(), d_oy.copy_to_host()
 
     def lnglat(self, x, y):
@@ -298,8 +331,8 @@ class CudaBackend:
         d_y = cuda.to_device(y)
         d_olng = cuda.device_array(n, dtype=np.float64)
         d_olat = cuda.device_array(n, dtype=np.float64)
-        _lnglat_kernel[self._blocks(n), _THREADS](
-            d_x, d_y, d_olng, d_olat, np.uint64(n))
+        self._launch(_lnglat_kernel, n,
+                     d_x, d_y, d_olng, d_olat, np.uint64(n))
         return d_olng.copy_to_host(), d_olat.copy_to_host()
 
     def tile(self, lng, lat, zoom, truncate=False):
@@ -310,9 +343,9 @@ class CudaBackend:
         d_lat = cuda.to_device(lat)
         d_ox = cuda.device_array(n, dtype=np.int32)
         d_oy = cuda.device_array(n, dtype=np.int32)
-        _tile_kernel[self._blocks(n), _THREADS](
-            d_lng, d_lat, d_ox, d_oy, np.int32(zoom),
-            np.int32(1 if truncate else 0), np.uint64(n))
+        self._launch(_tile_kernel, n,
+                     d_lng, d_lat, d_ox, d_oy, np.int32(zoom),
+                     np.int32(1 if truncate else 0), np.uint64(n))
         return d_ox.copy_to_host(), d_oy.copy_to_host()
 
     def ul(self, tx, ty, zoom):
@@ -323,8 +356,8 @@ class CudaBackend:
         d_ty = cuda.to_device(ty)
         d_olng = cuda.device_array(n, dtype=np.float64)
         d_olat = cuda.device_array(n, dtype=np.float64)
-        _ul_kernel[self._blocks(n), _THREADS](
-            d_tx, d_ty, d_olng, d_olat, np.int32(zoom), np.uint64(n))
+        self._launch(_ul_kernel, n,
+                     d_tx, d_ty, d_olng, d_olat, np.int32(zoom), np.uint64(n))
         return d_olng.copy_to_host(), d_olat.copy_to_host()
 
     def bounds(self, tx, ty, zoom):
@@ -337,8 +370,9 @@ class CudaBackend:
         d_os = cuda.device_array(n, dtype=np.float64)
         d_oe = cuda.device_array(n, dtype=np.float64)
         d_on = cuda.device_array(n, dtype=np.float64)
-        _bounds_kernel[self._blocks(n), _THREADS](
-            d_tx, d_ty, d_ow, d_os, d_oe, d_on, np.int32(zoom), np.uint64(n))
+        self._launch(_bounds_kernel, n,
+                     d_tx, d_ty, d_ow, d_os, d_oe, d_on,
+                     np.int32(zoom), np.uint64(n))
         return (d_ow.copy_to_host(), d_os.copy_to_host(),
                 d_oe.copy_to_host(), d_on.copy_to_host())
 
@@ -352,8 +386,9 @@ class CudaBackend:
         d_ob = cuda.device_array(n, dtype=np.float64)
         d_or = cuda.device_array(n, dtype=np.float64)
         d_ot = cuda.device_array(n, dtype=np.float64)
-        _xy_bounds_kernel[self._blocks(n), _THREADS](
-            d_tx, d_ty, d_ol, d_ob, d_or, d_ot, np.int32(zoom), np.uint64(n))
+        self._launch(_xy_bounds_kernel, n,
+                     d_tx, d_ty, d_ol, d_ob, d_or, d_ot,
+                     np.int32(zoom), np.uint64(n))
         return (d_ol.copy_to_host(), d_ob.copy_to_host(),
                 d_or.copy_to_host(), d_ot.copy_to_host())
 
@@ -364,8 +399,8 @@ class CudaBackend:
         d_tx = cuda.to_device(tx)
         d_ty = cuda.to_device(ty)
         d_oqk = cuda.device_array(n, dtype=np.uint64)
-        _quadkey_encode_kernel[self._blocks(n), _THREADS](
-            d_tx, d_ty, d_oqk, np.int32(zoom), np.uint64(n))
+        self._launch(_quadkey_encode_kernel, n,
+                     d_tx, d_ty, d_oqk, np.int32(zoom), np.uint64(n))
         return d_oqk.copy_to_host()
 
     def quadkey_decode(self, qk, zoom):
@@ -374,11 +409,12 @@ class CudaBackend:
         d_qk = cuda.to_device(qk)
         d_ox = cuda.device_array(n, dtype=np.int32)
         d_oy = cuda.device_array(n, dtype=np.int32)
-        _quadkey_decode_kernel[self._blocks(n), _THREADS](
-            d_qk, d_ox, d_oy, np.int32(zoom), np.uint64(n))
+        self._launch(_quadkey_decode_kernel, n,
+                     d_qk, d_ox, d_oy, np.int32(zoom), np.uint64(n))
         return d_ox.copy_to_host(), d_oy.copy_to_host()
 
-    def parent(self, tx, ty, zoom):
+    def parent(self, tx, ty, shift):
+        """Ancestor of each tile at ``shift`` zoom levels up."""
         tx = np.ascontiguousarray(tx, dtype=np.int32)
         ty = np.ascontiguousarray(ty, dtype=np.int32)
         n = tx.shape[0]
@@ -386,8 +422,8 @@ class CudaBackend:
         d_ty = cuda.to_device(ty)
         d_ox = cuda.device_array(n, dtype=np.int32)
         d_oy = cuda.device_array(n, dtype=np.int32)
-        _parent_kernel[self._blocks(n), _THREADS](
-            d_tx, d_ty, d_ox, d_oy, np.int32(zoom), np.uint64(n))
+        self._launch(_parent_kernel, n,
+                     d_tx, d_ty, d_ox, d_oy, np.int32(shift), np.uint64(n))
         return d_ox.copy_to_host(), d_oy.copy_to_host()
 
     def children(self, tx, ty):
@@ -398,8 +434,8 @@ class CudaBackend:
         d_ty = cuda.to_device(ty)
         d_ox = cuda.device_array(n * 4, dtype=np.int32)
         d_oy = cuda.device_array(n * 4, dtype=np.int32)
-        _children_kernel[self._blocks(n), _THREADS](
-            d_tx, d_ty, d_ox, d_oy, np.uint64(n))
+        self._launch(_children_kernel, n,
+                     d_tx, d_ty, d_ox, d_oy, np.uint64(n))
         return d_ox.copy_to_host(), d_oy.copy_to_host()
 
     def neighbors(self, tx, ty):
@@ -410,34 +446,31 @@ class CudaBackend:
         d_ty = cuda.to_device(ty)
         d_ox = cuda.device_array(n * 8, dtype=np.int32)
         d_oy = cuda.device_array(n * 8, dtype=np.int32)
-        _neighbors_kernel[self._blocks(n), _THREADS](
-            d_tx, d_ty, d_ox, d_oy, np.uint64(n))
+        self._launch(_neighbors_kernel, n,
+                     d_tx, d_ty, d_ox, d_oy, np.uint64(n))
         return d_ox.copy_to_host(), d_oy.copy_to_host()
 
-    def bounding_tile(self, west, south, east, north, zoom):
+    def bounding_tile(self, west, north, zoom):
+        """Tile of the bbox north-west corner at *zoom* (only w/n are used)."""
         west = np.ascontiguousarray(west, dtype=np.float64)
-        south = np.ascontiguousarray(south, dtype=np.float64)
-        east = np.ascontiguousarray(east, dtype=np.float64)
         north = np.ascontiguousarray(north, dtype=np.float64)
         n = west.shape[0]
         d_west = cuda.to_device(west)
-        d_south = cuda.to_device(south)
-        d_east = cuda.to_device(east)
         d_north = cuda.to_device(north)
         d_ox = cuda.device_array(n, dtype=np.int32)
         d_oy = cuda.device_array(n, dtype=np.int32)
-        _bounding_tile_kernel[self._blocks(n), _THREADS](
-            d_west, d_south, d_east, d_north, d_ox, d_oy,
-            np.int32(zoom), np.uint64(n))
+        self._launch(_bounding_tile_kernel, n,
+                     d_west, d_north, d_ox, d_oy,
+                     np.int32(zoom), np.uint64(n))
         return d_ox.copy_to_host(), d_oy.copy_to_host()
 
     def tiles_in_bbox(self, min_x, min_y, grid_w, grid_h):
         n = grid_w * grid_h
         d_ox = cuda.device_array(n, dtype=np.int32)
         d_oy = cuda.device_array(n, dtype=np.int32)
-        _tiles_in_bbox_kernel[self._blocks(n), _THREADS](
-            d_ox, d_oy, np.int32(min_x), np.int32(min_y),
-            np.int32(grid_w), np.uint64(n))
+        self._launch(_tiles_in_bbox_kernel, n,
+                     d_ox, d_oy, np.int32(min_x), np.int32(min_y),
+                     np.int32(grid_w), np.uint64(n))
         return d_ox.copy_to_host(), d_oy.copy_to_host()
 
 
