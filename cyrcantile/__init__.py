@@ -37,6 +37,7 @@ Example
 
 from __future__ import annotations
 
+import itertools
 import operator
 
 import numpy as np
@@ -425,7 +426,7 @@ def quadkey_to_tile(qk, zoom=None):
         ox, oy = _backend.quadkey_decode(ints, zoom)
     else:
         ox, oy = cpu.quadkey_decode_vec(ints, zoom)
-    return [Tile(int(a), int(b), zoom) for a, b in zip(ox, oy)]
+    return list(map(Tile, ox.tolist(), oy.tolist(), itertools.repeat(zoom)))
 
 
 # ------------------------------------------------------------------ #
@@ -629,7 +630,7 @@ def tiles(west, south, east, north, zooms):
                 continue
             if _backend is not None and gx * gy > 256:
                 ox, oy = _backend.tiles_in_bbox(tmin.x, tmin.y, gx, gy)
-                result.extend(Tile(xv, yv, z) for xv, yv in zip(ox.tolist(), oy.tolist()))
+                result.extend(map(Tile, ox.tolist(), oy.tolist(), itertools.repeat(z)))
             else:
                 for xv in range(tmin.x, tmax.x + 1):
                     for yv in range(tmin.y, tmax.y + 1):

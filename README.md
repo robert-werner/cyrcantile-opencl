@@ -194,6 +194,18 @@ FeatureCollection.  See `cyrcantile COMMAND --help` for all options.
 python main.py                       # 8M points by default
 python main.py --size 100_000_000    # the big guns
 python benchmarks/compare.py         # vs mercantile / supermercado / NumPy
+python benchmarks/batch.py           # millions of coords & millions of tiles
+```
+
+`benchmarks/batch.py` times **all 12 batch operations** (4 coordinate + 8
+tile) on every available backend (OpenCL, Vulkan, CUDA, multicore CPU,
+single-thread CPU), verifies the GPU results against the CPU reference and
+finishes with end-to-end public-API timings (quadkey strings, string
+decoding, tile enumeration):
+
+```bash
+python benchmarks/batch.py --coords 10_000_000 --tiles 10_000_000 --repeat 5
+python benchmarks/batch.py --backends opencl,cpu   # subset of backends
 ```
 
 Typical output (8M random points, zoom 12; AMD Radeon RX 560 + 12-core CPU):
@@ -208,7 +220,10 @@ Typical output (8M random points, zoom 12; AMD Radeon RX 560 + 12-core CPU):
 Note: on modest GPUs with f64 kernels a multicore numba CPU can be
 competitive; the GPU backends shine on bigger batches (and on machines
 whose CPUs are busy).  Vulkan's f32 may flip ~0.02% of tile indices at
-floor boundaries.
+floor boundaries.  Bit-twiddling ops (`parent`) and pure arithmetic
+(`xy_bounds`) are faster on the CPU than on the GPU — the dispatch
+thresholds favour the GPU for transcendental-heavy work (`tile`,
+`bounds`, `quadkey` at 30–50x).
 
 ## Notes & caveats
 

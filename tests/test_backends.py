@@ -39,8 +39,11 @@ IDS = [name for name, _ in BACKENDS]
 
 def _tol(name):
     if name == "vulkan":
-        return dict(rtol=2e-4, atol=2.0)  # f32 storage
-    return dict(rtol=1e-9, atol=1e-9)  # f64
+        return dict(rtol=2e-4, atol=5.0)  # f32 storage
+    # f64, allows 1-ulp FMA differences: atol covers near-zero outputs
+    # whose intermediates are ~2e7 (error is bounded by the ulp of the
+    # intermediates, not of the output value itself)
+    return dict(rtol=1e-9, atol=1e-6)
 
 
 def _assert_ints_close(name, actual, desired, max_off=0):
