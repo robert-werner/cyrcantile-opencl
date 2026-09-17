@@ -18,11 +18,21 @@ import contextlib
 import importlib
 import math
 import time
+import warnings
 
 import numpy as np
 
 import cyrcantile as ct
 from cyrcantile import _cpu
+
+# AMD/POCL OpenCL compilers emit (benign) remarks during kernel build;
+# the build itself is verified below, so keep the output clean.
+try:
+    import pyopencl
+
+    warnings.filterwarnings("ignore", category=pyopencl.CompilerWarning)
+except Exception:  # pragma: no cover - pyopencl optional
+    pass
 
 # Relative tolerances for result verification, per storage precision.
 # The absolute tolerance is scaled by each output array's magnitude:
@@ -387,9 +397,24 @@ def main():
 
     print("=" * 70)
     print("  cyrcantile batch benchmark")
+    print(f"  cyrcantile {ct.__version__} from {ct.__file__}")
     print(f"  coords: {args.coords:,}   tiles: {args.tiles:,}   "
           f"zoom: {args.zoom}   repeat: {args.repeat}")
     print("=" * 70)
+
+    # fail fast with an actionable message when a stale or partially
+    # synced cyrcantile is imported (the batch backends may still work
+    # while the public API is incomplete)
+    missing = [name for name in ("quadkey", "quadkey_to_tile", "parent",
+                                 "children", "neighbors", "bounding_tile",
+                                 "tiles", "feature")
+               if not hasattr(ct, name)]
+    if missing:
+        raise SystemExit(
+            f"error: the imported cyrcantile ({ct.__file__!r}) is missing "
+            f"public API: {', '.join(missing)}\n"
+            "This usually means a stale or partially synced installation.\n"
+            "Re-sync the repository and run:  pip install -e .")
 
     backends = collect_backends(wanted)
     if not backends:
