@@ -278,7 +278,10 @@ ruff check .        # lint
 ```
 
 GPU backend tests run automatically for every backend that initialises
-(OpenCL, Vulkan, CUDA); without a GPU they are skipped.
+(OpenCL, Vulkan, CUDA); without a GPU they are skipped.  The CUDA
+kernels are additionally verified on any machine through numba's CUDA
+simulator (`NUMBA_ENABLE_CUDASIM=1` — see `tests/test_cudasim.py`), which
+is how the historical `xy` degrees/radians bug was caught.
 
 ## License
 

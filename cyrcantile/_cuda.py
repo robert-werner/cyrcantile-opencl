@@ -72,6 +72,7 @@ def _xy_kernel(lng, lat, ox, oy, truncate, n):
     if truncate:
         lo = _clamp_lng_dev(lo)
         p = _clamp_lat_dev(p)
+    p = p * _D2R
     ox[i] = _RE * lo * _D2R
     oy[i] = _RE * math.log(math.tan(_QUARTER_PI + p * 0.5))
 
@@ -171,7 +172,9 @@ def _quadkey_decode_kernel(qk, ox, oy, zoom, n):
     i = cuda.grid(1)
     if i >= n:
         return
-    q = qk[i]
+    # int64 keeps the shift operands sign-uniform (packed quadkeys
+    # use at most 60 bits, so the cast is lossless)
+    q = int(qk[i])
     x = 0
     y = 0
     for j in range(zoom):
@@ -306,7 +309,8 @@ class CudaBackend:
         rejects zero-sized grids)."""
         if n <= 0:
             return
-        kernel[self._blocks(n), _THREADS](*args)
+        blocks = (n + _THREADS - 1) // _THREADS
+        kernel[blocks, _THREADS](*args)
 
     # -- batch operations ------------------------------------------
 

@@ -171,7 +171,7 @@ def _float_tol(precision, expected):
 
 
 def check_match(precision, got, expected):
-    """Verify *got* against the CPU reference *expected*."""
+    """Return None when *got* matches *expected*, else a description."""
     for g, e in zip(_as_tuple(got), _as_tuple(expected)):
         if g is e:
             continue  # same object (CPU reference itself)
@@ -180,15 +180,18 @@ def check_match(precision, got, expected):
         if np.issubdtype(g.dtype, np.floating):
             rtol, atol = _float_tol(precision, e)
             if not np.allclose(g, e, rtol=rtol, atol=atol):
-                return False
+                diff = np.abs(g - e)
+                return (f"float mismatch: max |diff| {diff.max():.3g} "
+                        f"vs rtol {rtol:g} / atol {atol:.3g} (scale-scaled)")
         elif precision == "f32":
             # tile indices may flip by one at f32 floor boundaries
             diff = np.abs(g.astype(np.int64) - e.astype(np.int64))
             if diff.max(initial=0) > 1:
-                return False
+                return f"index differs by {int(diff.max())} (allowed: 1)"
         elif not np.array_equal(g, e):
-            return False
-    return True
+            bad = int(np.count_nonzero(g != e))
+            return f"int mismatch: {bad} of {g.size} elements differ"
+    return None
 
 
 def fmt(ms):
@@ -259,8 +262,9 @@ def run_matrix(ops, backends, repeat):
             try:
                 ms, out = best_of(lambda fn=fn, backend=backend: fn(backend), repeat)
                 row[name] = ms
-                if not check_match(precision, out, expected):
-                    failures.append(f"{label} / {name}: result mismatch")
+                msg = check_match(precision, out, expected)
+                if msg:
+                    failures.append(f"{label} / {name}: {msg}")
                 del out
             except NotImplementedError as e:
                 row[name] = None
