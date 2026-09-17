@@ -389,6 +389,45 @@ def parse_args():
     return parser.parse_args()
 
 
+REQUIRED_PUBLIC_API = ("quadkey", "quadkey_to_tile", "parent", "children",
+                        "neighbors", "bounding_tile", "tiles", "feature")
+
+
+def _describe_module(mod):
+    """Human-readable import location, also for namespace packages."""
+    origin = getattr(mod, "__file__", None)
+    if origin:
+        return origin
+    spec = getattr(mod, "__spec__", None)
+    locs = list(getattr(spec, "submodule_search_locations", None) or [])
+    if locs:
+        return f"namespace package at {locs[0]!r} (no __init__.py!)"
+    return "unknown location (namespace package, no __init__.py)"
+
+
+def _check_environment():
+    """Fail fast when cyrcantile resolves to a stale or partial import."""
+    version = getattr(ct, "__version__", "unknown")
+    location = _describe_module(ct)
+    print(f"  cyrcantile {version} from {location}")
+    missing = [name for name in REQUIRED_PUBLIC_API if not hasattr(ct, name)]
+    if missing:
+        raise SystemExit(
+            f"error: the imported cyrcantile is incomplete:\n"
+            f"  location: {location}\n"
+            f"  version:  {version}\n"
+            f"  missing public API: {', '.join(missing)}\n"
+            "\n"
+            "A namespace package (no __init__.py) or a stale/partially\n"
+            "synced checkout produces exactly this: the batch backends\n"
+            "still import, but the top-level API does not exist.\n"
+            "\n"
+            "Fix: re-sync the repository (cyrcantile/__init__.py in\n"
+            "particular) and run:  pip install -e .\n"
+            'Check: python -c "import cyrcantile; '
+            'print(cyrcantile.__version__, cyrcantile.__file__)"')
+
+
 def main():
     args = parse_args()
     if args.coords <= 0 or args.tiles <= 0:
@@ -397,24 +436,10 @@ def main():
 
     print("=" * 70)
     print("  cyrcantile batch benchmark")
-    print(f"  cyrcantile {ct.__version__} from {ct.__file__}")
+    _check_environment()
     print(f"  coords: {args.coords:,}   tiles: {args.tiles:,}   "
           f"zoom: {args.zoom}   repeat: {args.repeat}")
     print("=" * 70)
-
-    # fail fast with an actionable message when a stale or partially
-    # synced cyrcantile is imported (the batch backends may still work
-    # while the public API is incomplete)
-    missing = [name for name in ("quadkey", "quadkey_to_tile", "parent",
-                                 "children", "neighbors", "bounding_tile",
-                                 "tiles", "feature")
-               if not hasattr(ct, name)]
-    if missing:
-        raise SystemExit(
-            f"error: the imported cyrcantile ({ct.__file__!r}) is missing "
-            f"public API: {', '.join(missing)}\n"
-            "This usually means a stale or partially synced installation.\n"
-            "Re-sync the repository and run:  pip install -e .")
 
     backends = collect_backends(wanted)
     if not backends:
