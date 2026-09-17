@@ -306,7 +306,8 @@ class CudaBackend:
         rejects zero-sized grids)."""
         if n <= 0:
             return
-        kernel[self._blocks(n), _THREADS](*args)
+        blocks = (n + _THREADS - 1) // _THREADS
+        kernel[blocks, _THREADS](*args)
 
     # -- batch operations ------------------------------------------
 
