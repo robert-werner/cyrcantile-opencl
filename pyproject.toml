@@ -27,7 +27,8 @@ classifiers = [
 ]
 dependencies = [
     "numpy>=1.21",
-    "numba>=0.60"
+    "numba>=0.60",
+    "click>=8.0"
 ]
 
 [project.optional-dependencies]
