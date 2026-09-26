@@ -1,7 +1,7 @@
-# cyrcantile — OpenCL / Vulkan / CUDA
+# cyrcantile — OpenCL / Vulkan / Metal / CUDA
 
 GPU-accelerated spherical-mercator tile utilities — an OpenCL, Vulkan and
-CUDA kernel rewrite of the original [cyrcantile](https://github.com/robert-werner/cyrcantile)
+Cuda/Metal kernel rewrite of the original [cyrcantile](https://github.com/robert-werner/cyrcantile)
 Cython project.
 
 ## What it does
@@ -9,7 +9,7 @@ Cython project.
 Provides the same API as [mercantile](https://github.com/mapbox/mercantile)
 1.2.x for converting between geographic coordinates (WGS-84), Web Mercator
 (EPSG:3857), and XYZ tile indices — but with the compute-heavy batch
-operations offloaded to GPU kernels (OpenCL, Vulkan, or CUDA).
+operations offloaded to GPU kernels (OpenCL, Vulkan, Metal, or CUDA).
 
 ## Installation
 
@@ -17,6 +17,7 @@ operations offloaded to GPU kernels (OpenCL, Vulkan, or CUDA).
 pip install .                    # core (NumPy only, CPU fallback)
 pip install .[opencl]            # + OpenCL   (pyopencl; Linux may need ocl-icd-opencl-dev)
 pip install .[vulkan]            # + Vulkan   (wgpu)
+pip install .[metal]             # + Metal    (wgpu; Apple Silicon/macOS)
 pip install .[cuda]              # + CUDA     (numba + NVIDIA GPU/driver)
 pip install .[cpu-speed]         # + multicore CPU (numba)
 pip install .[dev]               # tests + lint + mercantile oracle
@@ -33,6 +34,7 @@ cyrcantile/
 ├── _kernels.cl       # OpenCL C kernels (13 batch operations)
 ├── _backend.py       # PyOpenCL context manager, kernel & buffer pool
 ├── _vulkan.py        # wgpu/Vulkan backend with WGSL compute kernels
+├── _metal.py         # wgpu/Metal backend reusing the WGSL compute kernels
 ├── _cuda.py          # numba.cuda backend with device kernels
 ├── _cpu.py           # Pure-Python + NumPy (+ optional Numba) fallback
 └── _types.py         # NamedTuple types (Tile, LngLat, Bbox, …)
@@ -45,13 +47,13 @@ cyrcantile/
   automatically by the public API
 - **No GPU device** → fast multicore CPU fallback (with a one-time
   `RuntimeWarning` explaining why)
-- **Vulkan / CUDA** → opt-in, used directly via their `get_backend()`
+- **Vulkan / Metal / CUDA** → opt-in, used directly via their `get_backend()`
   exports (see `main.py`), so they never interfere with automatic dispatch
 
 `ct.ACTIVE_BACKEND` reports what serves automatic batch dispatch
 (`"opencl"` or `"cpu"`). `ct.HAS_OPENCL`, `ct.HAS_NUMBA`, and
-`cyrcantile._vulkan.HAS_VULKAN` / `cyrcantile._cuda.HAS_CUDA` report what
-is available.
+`cyrcantile._vulkan.HAS_VULKAN`, `cyrcantile._metal.HAS_METAL`, and
+`cyrcantile._cuda.HAS_CUDA` report what is available.
 
 ### OpenCL device selection
 
@@ -75,6 +77,22 @@ The NumPy vectorised fallback runs on **all cores** for large batches:
 | **Single-thread NumPy** | < 200k elements | Avoids dispatch overhead on small inputs |
 
 `ct.HAS_NUMBA` reports whether the JIT path is active.
+
+### Metal on Apple Silicon
+
+Install the Metal extra and obtain the opt-in batch backend directly:
+
+```python
+from cyrcantile._metal import get_backend
+
+metal = get_backend()
+if metal is not None:
+    xs, ys = metal.tile(lons, lats, 12)
+```
+
+Metal uses the same WGSL shaders as the Vulkan backend through `wgpu`; it
+therefore works with native Apple GPUs such as M-series chips and has the
+same f32 precision characteristics.
 
 ## Usage
 
@@ -198,14 +216,14 @@ python benchmarks/batch.py           # millions of coords & millions of tiles
 ```
 
 `benchmarks/batch.py` times **all 12 batch operations** (4 coordinate + 8
-tile) on every available backend (OpenCL, Vulkan, CUDA, multicore CPU,
+tile) on every available backend (OpenCL, Vulkan, Metal, CUDA, multicore CPU,
 single-thread CPU), verifies the GPU results against the CPU reference and
 finishes with end-to-end public-API timings (quadkey strings, string
 decoding, tile enumeration):
 
 ```bash
 python benchmarks/batch.py --coords 10_000_000 --tiles 10_000_000 --repeat 5
-python benchmarks/batch.py --backends opencl,cpu   # subset of backends
+python benchmarks/batch.py --backends metal,cpu    # M-series Mac subset
 ```
 
 Typical output (8M random points, zoom 12; AMD Radeon RX 560 + 12-core CPU):
@@ -219,7 +237,7 @@ Typical output (8M random points, zoom 12; AMD Radeon RX 560 + 12-core CPU):
 
 Note: on modest GPUs with f64 kernels a multicore numba CPU can be
 competitive; the GPU backends shine on bigger batches (and on machines
-whose CPUs are busy).  Vulkan's f32 may flip ~0.02% of tile indices at
+whose CPUs are busy).  The Vulkan and Metal f32 backends may flip ~0.02% of tile indices at
 floor boundaries.  Bit-twiddling ops (`parent`) and pure arithmetic
 (`xy_bounds`) are faster on the CPU than on the GPU — the dispatch
 thresholds favour the GPU for transcendental-heavy work (`tile`,
@@ -227,11 +245,11 @@ thresholds favour the GPU for transcendental-heavy work (`tile`,
 
 ## Notes & caveats
 
-- **Vulkan precision:** WGSL kernels use f32 storage buffers (f64 needs
+- **Vulkan / Metal precision:** WGSL kernels use f32 storage buffers (f64 needs
   `shader-f64`, which many devices lack). Float outputs are accurate to
   ~1e-5 relative; `tile` indices may differ by 1 at floor boundaries.
   OpenCL and CUDA compute in f64 and match the CPU exactly.
-- **Vulkan quadkeys** require the `shader-int64` device feature; the
+- **Vulkan / Metal quadkeys** require the `shader-int64` device feature; the
   backend raises `NotImplementedError` when it is missing.
 - On `llvmpipe` (software) Vulkan devices the f32 transcendentals
   (`exp`/`log`/`tan`/`atan`/`sin`/`sinh`) compute incorrectly, so
@@ -245,9 +263,9 @@ thresholds favour the GPU for transcendental-heavy work (`tile`,
 | Original | 0.3 |
 |---|---|
 | `_base.pxd` (struct decls) | `_types.py` (NamedTuples) |
-| `_base.pyx` (Cython impl) | `_kernels.cl` + `_backend.py` / `_vulkan.py` / `_cuda.py` |
+| `_base.pyx` (Cython impl) | `_kernels.cl` + `_backend.py` / `_vulkan.py` / `_metal.py` / `_cuda.py` |
 | `setup.py` (cythonize) | `pyproject.toml` |
-| `numba` dependency | optional extras: `opencl` / `vulkan` / `cuda` / `cpu-speed` |
+| `numba` dependency | optional extras: `opencl` / `vulkan` / `metal` / `cuda` / `cpu-speed` |
 
 Breaking changes in 0.3:
 
@@ -278,7 +296,7 @@ ruff check .        # lint
 ```
 
 GPU backend tests run automatically for every backend that initialises
-(OpenCL, Vulkan, CUDA); without a GPU they are skipped.  The CUDA
+(OpenCL, Vulkan, Metal, CUDA); without a GPU they are skipped.  The CUDA
 kernels are additionally verified on any machine through numba's CUDA
 simulator (`NUMBA_ENABLE_CUDASIM=1` — see `tests/test_cudasim.py`), which
 is how the historical `xy` degrees/radians bug was caught.

@@ -129,6 +129,7 @@ def collect_backends(wanted):
     for name, module in (
         ("opencl", "cyrcantile._backend"),
         ("vulkan", "cyrcantile._vulkan"),
+        ("metal", "cyrcantile._metal"),
         ("cuda", "cyrcantile._cuda"),
     ):
         if name not in wanted:
@@ -139,7 +140,9 @@ def collect_backends(wanted):
         except Exception:
             backend = None
         if backend is not None:
-            backends.append((name, backend, "f32" if name == "vulkan" else "f64"))
+            backends.append(
+                (name, backend, "f32" if name in {"vulkan", "metal"} else "f64")
+            )
         else:
             print(f"# {name}: unavailable - skipped")
     if "cpu" in wanted:
@@ -382,7 +385,7 @@ def parse_args():
                         help="zoom level for the batches (default 14)")
     parser.add_argument("--repeat", type=int, default=3,
                         help="timed repetitions, best is kept (default 3)")
-    parser.add_argument("--backends", default="opencl,vulkan,cuda,cpu,cpu-1",
+    parser.add_argument("--backends", default="opencl,vulkan,metal,cuda,cpu,cpu-1",
                         help="comma-separated backends to benchmark")
     parser.add_argument("--no-public-api", action="store_true",
                         help="skip the end-to-end public API section")

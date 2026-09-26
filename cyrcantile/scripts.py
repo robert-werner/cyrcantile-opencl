@@ -418,6 +418,11 @@ def info():
         click.echo(f"CUDA available: {HAS_CUDA}")
     except Exception:
         click.echo("CUDA available: False")
+    try:
+        from cyrcantile._metal import HAS_METAL
+        click.echo(f"Metal available: {HAS_METAL}")
+    except Exception:
+        click.echo("Metal available: False")
 
 
 @cli.command(short_help="Run a tile-batch benchmark.")

@@ -3,7 +3,7 @@
 Catches the "backend method references a deleted helper" bug class
 (e.g. CudaBackend._launch calling the removed self._blocks) on machines
 where the backend cannot even initialise, plus API-skew between the
-OpenCL / Vulkan / CUDA backends.
+OpenCL / Vulkan / Metal / CUDA backends.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ BACKEND_CLASSES = [
     ("_backend", "OpenCLBackend"),
     ("_cuda", "CudaBackend"),
     ("_vulkan", "VulkanBackend"),
+    ("_metal", "MetalBackend"),
 ]
 
 BACKEND_METHODS = [

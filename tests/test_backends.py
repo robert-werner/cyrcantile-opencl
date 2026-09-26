@@ -1,8 +1,8 @@
-"""GPU backends (OpenCL / Vulkan / CUDA) must reproduce the CPU results.
+"""GPU backends (OpenCL / Vulkan / Metal / CUDA) must reproduce CPU results.
 
 OpenCL and CUDA compute in f64 — results are required to match the CPU
-closely.  Vulkan computes in f32, so float outputs use loose tolerances
-and tile indices may differ by at most 1 at floor boundaries.
+closely.  Vulkan and Metal compute in f32, so float outputs use loose
+tolerances and tile indices may differ by at most 1 at floor boundaries.
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ def _available_backends():
     for name, module in (
         ("opencl", "cyrcantile._backend"),
         ("vulkan", "cyrcantile._vulkan"),
+        ("metal", "cyrcantile._metal"),
         ("cuda", "cyrcantile._cuda"),
     ):
         try:
@@ -38,7 +39,7 @@ IDS = [name for name, _ in BACKENDS]
 
 
 def _tol(name):
-    if name == "vulkan":
+    if name in {"vulkan", "metal"}:
         return dict(rtol=2e-4, atol=5.0)  # f32 storage
     # f64, allows 1-ulp FMA differences: atol covers near-zero outputs
     # whose intermediates are ~2e7 (error is bounded by the ulp of the
@@ -47,7 +48,7 @@ def _tol(name):
 
 
 def _assert_ints_close(name, actual, desired, max_off=0):
-    if name == "vulkan":
+    if name in {"vulkan", "metal"}:
         np.testing.assert_array_less(np.abs(actual - desired), max_off + 1)
     else:
         np.testing.assert_array_equal(actual, desired)

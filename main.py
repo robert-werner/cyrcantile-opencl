@@ -3,7 +3,7 @@
 Usage:
     python main.py
     python main.py --size 100_000_000 --zoom 12
-    python main.py --backends opencl,vulkan,cuda --backends-cpu false
+    python main.py --backends opencl,vulkan,metal,cuda --backends-cpu false
 """
 
 from __future__ import annotations
@@ -131,6 +131,28 @@ def demo_batch_vulkan(lons, lats, zoom, backends):
         print(f"  Vulkan vs CPU: {mism}/{2 * len(xs)} indices differ (f32 boundaries)")
 
 
+def demo_batch_metal(lons, lats, zoom, backends):
+    if "metal" not in backends:
+        return
+    try:
+        from cyrcantile._metal import HAS_METAL
+        from cyrcantile._metal import get_backend as metal_get_backend
+    except Exception:
+        HAS_METAL, metal_get_backend = False, None
+
+    banner("BATCH API - Metal backend")
+    print(f"  Metal available: {HAS_METAL}")
+    backend = metal_get_backend() if (HAS_METAL and metal_get_backend) else None
+    run = backend.tile if backend is not None else None
+    gpu_ms, xs, ys = bench_backend("Metal", run, lons, lats, zoom)
+
+    xs_c, ys_c = cpu_reference(lons, lats, zoom)
+    if xs is not None:
+        # Metal uses the shared f32 WGSL kernels: floor boundaries can differ.
+        mism = int(np.count_nonzero(xs != xs_c) + np.count_nonzero(ys != ys_c))
+        print(f"  Metal vs CPU: {mism}/{2 * len(xs)} indices differ (f32 boundaries)")
+
+
 def demo_batch_cuda(lons, lats, zoom, backends):
     if "cuda" not in backends:
         return
@@ -194,10 +216,10 @@ def demo_feature():
 
 def main():
     parser = argparse.ArgumentParser(description="cyrcantile demo & benchmark")
-    parser.add_argument("--size", type=int, default=8_000_000,
+    parser.add_argument("--size", type=int, default=100_000_000,
                         help="points per batch benchmark (default 8,000,000)")
     parser.add_argument("--zoom", type=int, default=12, help="zoom level (default 12)")
-    parser.add_argument("--backends", default="opencl,vulkan,cuda",
+    parser.add_argument("--backends", default="opencl,vulkan,metal,cuda",
                         help="comma-separated GPU backends to benchmark")
     parser.add_argument("--cpu-parallel", dest="cpu_parallel",
                         action=argparse.BooleanOptionalAction, default=True,
@@ -211,6 +233,7 @@ def main():
 
     demo_batch(lons, lats, zoom, backends)
     demo_batch_vulkan(lons, lats, zoom, backends)
+    demo_batch_metal(lons, lats, zoom, backends)
     demo_batch_cuda(lons, lats, zoom, backends)
     demo_cpu_parallel(lons, lats, zoom, args.cpu_parallel)
     demo_tiles_in_bbox()
